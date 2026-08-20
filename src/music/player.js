@@ -1,13 +1,13 @@
 const { createAudioResource, StreamType } = require("@discordjs/voice");
 
-function playStream(player, audioStream) {
+function playStream(player, audioStream, streamType = StreamType.WebmOpus) {
     if (!audioStream) {
         console.error('❌ Erro: O stream de áudio está indefinido!');
         return;
     }
 
     const resource = createAudioResource(audioStream, {
-        inputType: StreamType.Arbitrary, 
+        inputType: streamType,
         inlineVolume: true
     });
 

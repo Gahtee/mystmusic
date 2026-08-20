@@ -9,7 +9,7 @@ async function getAudioMetadata(query) {
     } else {
         target = `"ytsearch1:${query}"`;
     }
-    const cmd = `yt-dlp --cookies cookies.txt --js-runtimes node --default-search "ytsearch" --no-playlist --print "%(title)s\n%(id)s\n%(uploader)s" ${target}`;
+    const cmd = `yt-dlp --cookies cookies.txt --js-runtimes node --default-search "ytsearch" --no-playlist -f "bestaudio[acodec=opus]/bestaudio" --print "%(title)s\n%(id)s\n%(uploader)s\n%(acodec)s" ${target}`;
     
     const { stdout } = await execPromise(cmd);
     const lines = stdout.trim().split('\n');
@@ -24,7 +24,9 @@ async function getAudioMetadata(query) {
         title: lines[0],
         url: `https://www.youtube.com/watch?v=${videoId}`,
         thumbnail: `https://img.youtube.com/vi/${videoId}/hqdefault.jpg`,
-        uploader: lines[2] || "Canal Desconhecido"
+        uploader: lines[2] || "Canal Desconhecido",
+        // Sabemos com certeza o codec aqui, então definimos true/false (não null)
+        isOpus: (lines[3] || '').trim() === 'opus'
     };
 }
 
@@ -37,7 +39,10 @@ async function getPlaylistMetadata(playlistUrl) {
         title: entry.title,
         url: `https://www.youtube.com/watch?v=${entry.id}`,
         thumbnail: entry.id ? `https://img.youtube.com/vi/${entry.id}/hqdefault.jpg` : null, 
-        uploader: entry.uploader || entry.channel || "Canal do YouTube" 
+        uploader: entry.uploader || entry.channel || "Canal do YouTube",
+        // --flat-playlist não extrai o codec (seria lento demais fazer 1 extração por faixa).
+        // null = "desconhecido", o manager assume Opus e tem fallback automático se falhar.
+        isOpus: null
     }));
 
     return {
@@ -49,10 +54,8 @@ async function getPlaylistMetadata(playlistUrl) {
 function getAudioStream(url) {
     const args = [
         '--cookies', 'cookies.txt',
-        '-f', 'bestaudio',
-        '--extract-audio',
+        '-f', 'bestaudio[acodec=opus]/bestaudio',
         '--js-runtimes', 'node',
-        '--audio-format', 'opus',
         '-o', '-',
         '--no-playlist',
         '--quiet',

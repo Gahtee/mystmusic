@@ -1,4 +1,4 @@
-const { joinVoiceChannel, createAudioPlayer, entersState, VoiceConnectionStatus } = require("@discordjs/voice");
+const { joinVoiceChannel, createAudioPlayer, entersState, VoiceConnectionStatus, StreamType } = require("@discordjs/voice");
 const { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require("discord.js");
 const { playStream } = require("./player");
 const { getAudioMetadata, getAudioStream, getPlaylistMetadata, } = require("./resolver");
@@ -75,12 +75,32 @@ async function enviarNovoPainel(channel, state, metadata) {
     state.lastPanelMessage = await channel.send(painel);
 }
 
+// Centraliza a decisão de qual StreamType usar e o retry automático.
+// song.isOpus: true (confirmado), false (confirmado outro codec) ou null/undefined (desconhecido, ex: playlists).
+function iniciarReproducao(state, song, forcarTranscodificacao = false) {
+    const streamType = (forcarTranscodificacao || song.isOpus === false)
+        ? StreamType.Arbitrary
+        : StreamType.WebmOpus;
+
+    state.playbackStartedAt = Date.now();
+    if (!forcarTranscodificacao) state.fallbackAttempted = false;
+
+    const audioStream = getAudioStream(song.url);
+    playStream(state.player, audioStream, streamType);
+}
+
 async function play(message, query) {
     const voiceChannel = message.member.voice.channel;
     if (!voiceChannel) return message.reply("Entra num canal de voz primeiro!");
 
     const guildId = message.guild.id;
     let state = states.get(guildId);
+
+    const isPlaylist = query.includes('list=');
+    // Dispara a busca de metadados JÁ, em paralelo com a conexão de voz abaixo — as
+    // duas coisas são independentes, não precisam rodar em sequência.
+    const metadataPromise = isPlaylist ? getPlaylistMetadata(query) : getAudioMetadata(query);
+    metadataPromise.catch(() => {}); // evita warning de unhandledRejection; o erro real é tratado no try/catch mais abaixo
 
     if (!state) {
         const connection = joinVoiceChannel({
@@ -102,7 +122,23 @@ async function play(message, query) {
 
         serverPlayer.on('error', error => {
             console.error(`Erro no player do servidor ${guildId}: ${error.message}`);
-            serverPlayer.stop(); 
+
+            const currentState = states.get(guildId);
+            const tocandoHaPouco = currentState
+                && Date.now() - (currentState.playbackStartedAt || 0) < 2500;
+
+            // Se a falha foi logo no início (provável erro de demux por assumirmos Opus
+            // errado) e ainda não tentamos o fallback, tenta de novo já transcodificando.
+            // Chamar iniciarReproducao aqui dentro, de forma síncrona, faz a própria lib
+            // @discordjs/voice cancelar a transição forçada para "idle" (ela só força idle
+            // se o resource ainda for o mesmo que falhou) — então a fila NÃO avança.
+            if (currentState && currentState.current && tocandoHaPouco && !currentState.fallbackAttempted) {
+                currentState.fallbackAttempted = true;
+                console.warn(`⚠️ Falha ao tocar "${currentState.current.title}" via WebmOpus. Tentando novamente com transcodificação (Arbitrary)...`);
+                return iniciarReproducao(currentState, currentState.current, true);
+            }
+
+            serverPlayer.stop();
         });
 
         // Loop da Fila Automática (Quando a música termina)
@@ -116,8 +152,7 @@ async function play(message, query) {
                 if (currentState.queue.length > 0) {
                     currentState.current = currentState.queue[0]; 
                     
-                    const nextStream = getAudioStream(currentState.current.url);
-                    playStream(currentState.player, nextStream);
+                    iniciarReproducao(currentState, currentState.current);
 
                     // Envia o painel automático para a próxima música
                     if (currentState.textChannel) {
@@ -145,10 +180,10 @@ async function play(message, query) {
     }
 
     try {
-        if (query.includes('list=')) {
+        if (isPlaylist) {
             message.reply("🔍 Processando playlist... Isso pode levar alguns segundos.");
 
-            const { playlistTitle, songs } = await getPlaylistMetadata(query);
+            const { playlistTitle, songs } = await metadataPromise;
             
             if (!songs || songs.length === 0) {
                 return message.reply("❌ Não encontrei nenhuma música válida nessa playlist.");
@@ -164,14 +199,13 @@ async function play(message, query) {
 
             if (state.queue.length === songs.length) {
                 state.current = state.queue[0];
-                const audioStream = getAudioStream(state.current.url);
-                playStream(state.player, audioStream);
+                iniciarReproducao(state, state.current);
                 
                 await enviarNovoPainel(message.channel, state, state.current);
                 savePlayLog(guildId, message.author.id, state.current.query, state.current.title, "SUCCESS");
             }
         } else {
-            const metadata = await getAudioMetadata(query);
+            const metadata = await metadataPromise;
             metadata.requestedBy = message.author.id;
             metadata.query = query;
 
@@ -179,8 +213,7 @@ async function play(message, query) {
 
             if (state.queue.length === 1) {
                 state.current = metadata;
-                const audioStream = getAudioStream(metadata.url); 
-                playStream(state.player, audioStream);
+                iniciarReproducao(state, metadata);
                 
                 await enviarNovoPainel(message.channel, state, metadata);
                 savePlayLog(guildId, message.author.id, query, metadata.title, "SUCCESS");
