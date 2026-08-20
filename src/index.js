@@ -31,6 +31,7 @@ const {
   states,
 } = require("./music/manager");
 const { logsDb, playlistDb } = require("./config/sqlite");
+const { exec } = require("child_process");
 
 const client = new Client({
   intents: [
@@ -41,8 +42,11 @@ const client = new Client({
   ],
 });
 
+const { startYtDlpAutoUpdater } = require("./config/updater");
+
 client.once("clientReady", () => {
   console.log(`Bot online como ${client.user.tag}`);
+  startYtDlpAutoUpdater();
   client.guilds.cache.forEach((guild) => {
     if (!GUILDS.includes(guild.id)) {
       console.log(`Saindo da guilda: ${guild.name}`);
@@ -437,7 +441,7 @@ client.on("messageCreate", async (message) => {
   if (
     message.content.startsWith("!shuffle") ||
     message.content.startsWith("!misturar")
-  ) {
+    ) {
     const guildId = message.guild.id;
     const sucesso = shuffleQueue(guildId);
 
@@ -452,18 +456,20 @@ client.on("messageCreate", async (message) => {
     }
   }
   if (
-    message.content.startsWith("!botmorreu") ||
-    message.content.startsWith("!botbosta")
-  ) {
-    await message.reply("🔄 Reiniciando o bot...");
+      message.content.startsWith("!botmorreu") ||
+      message.content.startsWith("!botbosta")
+    ) {
+      await message.reply("🔄 Reiniciando o bot...");
 
-    setTimeout(() => {
-      exec("pm2 restart mystmusic", (error) => {
-        if (error) console.error("Erro ao reiniciar:", error);
-      });
-    }, 1000);
-  }
-});
+      setTimeout(() => {
+        exec("pm2 restart mystmusic", (error, stdout, stderr) => {
+          if (error && error.signal !== "SIGINT") {
+            console.error("Erro ao reiniciar via PM2:", error, stderr);
+          }
+        });
+      }, 1000);
+    }
+  });
 
 client.on("voiceStateUpdate", async (oldState, newState) => {
   const guildId = oldState.guild.id;
