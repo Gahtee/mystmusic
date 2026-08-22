@@ -1,7 +1,7 @@
 const { joinVoiceChannel, createAudioPlayer, entersState, VoiceConnectionStatus, StreamType } = require("@discordjs/voice");
 const { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require("discord.js");
 const { playStream } = require("./player");
-const { getAudioMetadata, getAudioStream, getPlaylistMetadata, } = require("./resolver");
+const { getAudioMetadata, getAudioStream, getPlaylistMetadata } = require("./resolver");
 const { logsDb, playlistDb } = require("../config/sqlite");
 const states = new Map();
 
@@ -89,17 +89,42 @@ function iniciarReproducao(state, song, forcarTranscodificacao = false) {
     playStream(state.player, audioStream, streamType);
 }
 
-async function play(message, query) {
+// Faixas vindas de playlist são listadas com --flat-playlist (rápido), mas o
+// extrator do SoundCloud não preenche título/uploader/thumbnail nesse modo (limitação
+// conhecida do yt-dlp). Se estiver faltando, busca os metadados completos AGORA — só
+// dessa faixa, não da playlist inteira, então não impacta o tempo de adicionar à fila.
+async function garantirMetadadosCompletos(song) {
+    if (song.title) return song;
+    try {
+        const completo = await getAudioMetadata(song.url);
+        song.title = completo.title;
+        song.uploader = completo.uploader;
+        song.thumbnail = completo.thumbnail;
+        song.isOpus = completo.isOpus;
+    } catch (err) {
+        console.error(`Falha ao completar metadados de ${song.url}:`, err.message);
+        song.title = song.title || "Título indisponível";
+    }
+    return song;
+}
+
+// Detecta playlist tanto do YouTube (?list=...) quanto do SoundCloud (.../sets/...).
+function isPlaylistUrl(query) {
+    return query.includes('list=') || /soundcloud\.com\/[^/]+\/sets\//i.test(query);
+}
+
+async function play(message, query, searchEngine = 'ytsearch') {
     const voiceChannel = message.member.voice.channel;
     if (!voiceChannel) return message.reply("Entra num canal de voz primeiro!");
 
     const guildId = message.guild.id;
     let state = states.get(guildId);
 
-    const isPlaylist = query.includes('list=');
+    const isPlaylist = isPlaylistUrl(query);
     // Dispara a busca de metadados JÁ, em paralelo com a conexão de voz abaixo — as
     // duas coisas são independentes, não precisam rodar em sequência.
-    const metadataPromise = isPlaylist ? getPlaylistMetadata(query) : getAudioMetadata(query);
+    // searchEngine só é usado quando query não é uma URL (texto livre).
+    const metadataPromise = isPlaylist ? getPlaylistMetadata(query) : getAudioMetadata(query, searchEngine);
     metadataPromise.catch(() => {}); // evita warning de unhandledRejection; o erro real é tratado no try/catch mais abaixo
 
     if (!state) {
@@ -154,6 +179,10 @@ async function play(message, query) {
                     
                     iniciarReproducao(currentState, currentState.current);
 
+                    // Garante título/uploader/thumbnail antes de montar o painel (necessário
+                    // pro SoundCloud, cujo modo --flat-playlist não traz esses campos).
+                    await garantirMetadadosCompletos(currentState.current);
+
                     // Envia o painel automático para a próxima música
                     if (currentState.textChannel) {
                         await enviarNovoPainel(currentState.textChannel, currentState, currentState.current);
@@ -200,7 +229,11 @@ async function play(message, query) {
             if (state.queue.length === songs.length) {
                 state.current = state.queue[0];
                 iniciarReproducao(state, state.current);
-                
+
+                // Garante título/uploader/thumbnail antes de montar o painel (necessário
+                // pro SoundCloud, cujo modo --flat-playlist não traz esses campos).
+                await garantirMetadadosCompletos(state.current);
+
                 await enviarNovoPainel(message.channel, state, state.current);
                 savePlayLog(guildId, message.author.id, state.current.query, state.current.title, "SUCCESS");
             }
@@ -223,7 +256,8 @@ async function play(message, query) {
         }
     } catch (error) {
         console.error("Erro no processamento:", error);
-        message.reply("Deu erro ao buscar a música ou playlist.");
+        savePlayLog(guildId, message.author.id, query, null, "FAILED", error.message);
+        message.reply(error.message || "Deu erro ao buscar a música ou playlist.");
     }
 }
 
@@ -241,7 +275,7 @@ async function playNow(message, query) {
 
     try {
 
-        if (query.includes('list=')) {
+        if (isPlaylistUrl(query)) {
             message.reply("🔍 Processando fura-fila de playlist... Isso pode levar alguns segundos.");
             const { playlistTitle, songs } = await getPlaylistMetadata(query);
             

@@ -2,30 +2,64 @@ const { spawn, exec } = require('child_process');
 const util = require('util');
 const execPromise = util.promisify(exec);
 
-async function getAudioMetadata(query) {
+// Traduz os erros mais comuns do yt-dlp (stderr) pra uma mensagem clara pro usuário.
+// Se não reconhecer o padrão, devolve a primeira linha de erro do próprio yt-dlp.
+function friendlyExtractionError(err, query) {
+    const stderr = err.stderr || '';
+
+    if (/DRM protected/i.test(stderr)) {
+        return new Error('🔒 Essa faixa é protegida por DRM e não pode ser reproduzida (comum em faixas de selo/gravadora no SoundCloud).');
+    }
+    if (/Video unavailable|This video is (private|unavailable)/i.test(stderr)) {
+        return new Error('🚫 Esse conteúdo está indisponível (removido, privado ou bloqueado).');
+    }
+    if (/Sign in to confirm|age[- ]restricted/i.test(stderr)) {
+        return new Error('🔞 Esse conteúdo tem restrição de idade/login e não pode ser tocado.');
+    }
+    if (/not available in your country|geo.?restrict/i.test(stderr)) {
+        return new Error('🌍 Esse conteúdo está bloqueado na região do servidor.');
+    }
+
+    const primeiraLinhaErro = stderr.split('\n').find(l => l.trim().startsWith('ERROR'));
+    return new Error(primeiraLinhaErro
+        ? `Falha ao buscar "${query}": ${primeiraLinhaErro.replace(/^ERROR:\s*/, '')}`
+        : `Falha ao buscar "${query}".`);
+}
+
+// searchEngine: "ytsearch" (padrão, YouTube) ou "scsearch" (SoundCloud) — só é usado
+// quando "query" não é uma URL. Se for uma URL (YouTube OU SoundCloud), o yt-dlp
+// detecta o site sozinho pelo domínio.
+async function getAudioMetadata(query, searchEngine = 'ytsearch') {
     let target;
     if (query.startsWith('http://') || query.startsWith('https://')) {
         target = `"${query}"`;
     } else {
-        target = `"ytsearch1:${query}"`;
+        target = `"${searchEngine}1:${query}"`;
     }
-    const cmd = `yt-dlp --cookies cookies.txt --js-runtimes node --default-search "ytsearch" --no-playlist -f "bestaudio[acodec=opus]/bestaudio" --print "%(title)s\n%(id)s\n%(uploader)s\n%(acodec)s" ${target}`;
-    
-    const { stdout } = await execPromise(cmd);
-    const lines = stdout.trim().split('\n');
-    
-    const videoId = lines[1] ? lines[1].trim() : null;
+    // Seletor com 3 níveis: opus puro (ideal) → qualquer áudio puro → formato combinado
+    // vídeo+áudio como último recurso (alguns vídeos ficam sem NENHUM "bestaudio" por
+    // causa do SABR do YouTube, e só sobra um formato tipo "18", com vídeo junto).
+    const cmd = `yt-dlp --cookies cookies.txt --js-runtimes node --no-playlist -f "bestaudio[acodec=opus]/bestaudio/best" --print "%(title)s\n%(webpage_url)s\n%(uploader)s\n%(acodec)s\n%(thumbnail)s" ${target}`;
 
-    if (!videoId || videoId === 'undefined') {
-        throw new Error(`Não foi possível extrair um ID de vídeo válido para a busca: ${query}`);
+    let stdout;
+    try {
+        ({ stdout } = await execPromise(cmd));
+    } catch (err) {
+        throw friendlyExtractionError(err, query);
+    }
+    const lines = stdout.trim().split('\n');
+
+    const pageUrl = lines[1] ? lines[1].trim() : null;
+
+    if (!pageUrl || pageUrl === 'NA') {
+        throw new Error(`Não foi possível extrair uma URL válida para: ${query}`);
     }
 
     return {
         title: lines[0],
-        url: `https://www.youtube.com/watch?v=${videoId}`,
-        thumbnail: `https://img.youtube.com/vi/${videoId}/hqdefault.jpg`,
-        uploader: lines[2] || "Canal Desconhecido",
-        // Sabemos com certeza o codec aqui, então definimos true/false (não null)
+        url: pageUrl,
+        thumbnail: (lines[4] && lines[4] !== 'NA') ? lines[4].trim() : null,
+        uploader: lines[2] || "Desconhecido",
         isOpus: (lines[3] || '').trim() === 'opus'
     };
 }
@@ -37,9 +71,9 @@ async function getPlaylistMetadata(playlistUrl) {
     const playlistData = JSON.parse(stdout);
     const songs = playlistData.entries.map(entry => ({
         title: entry.title,
-        url: `https://www.youtube.com/watch?v=${entry.id}`,
-        thumbnail: entry.id ? `https://img.youtube.com/vi/${entry.id}/hqdefault.jpg` : null, 
-        uploader: entry.uploader || entry.channel || "Canal do YouTube",
+        url: entry.url || entry.webpage_url || (entry.id ? `https://www.youtube.com/watch?v=${entry.id}` : null),
+        thumbnail: entry.thumbnail || (entry.id ? `https://img.youtube.com/vi/${entry.id}/hqdefault.jpg` : null),
+        uploader: entry.uploader || entry.channel || "Desconhecido",
         // --flat-playlist não extrai o codec (seria lento demais fazer 1 extração por faixa).
         // null = "desconhecido", o manager assume Opus e tem fallback automático se falhar.
         isOpus: null
@@ -54,7 +88,7 @@ async function getPlaylistMetadata(playlistUrl) {
 function getAudioStream(url) {
     const args = [
         '--cookies', 'cookies.txt',
-        '-f', 'bestaudio[acodec=opus]/bestaudio',
+        '-f', 'bestaudio[acodec=opus]/bestaudio/best',
         '--js-runtimes', 'node',
         '-o', '-',
         '--no-playlist',
