@@ -39,7 +39,7 @@ async function getAudioMetadata(query, searchEngine = 'ytsearch') {
     // Seletor com 3 níveis: opus puro (ideal) → qualquer áudio puro → formato combinado
     // vídeo+áudio como último recurso (alguns vídeos ficam sem NENHUM "bestaudio" por
     // causa do SABR do YouTube, e só sobra um formato tipo "18", com vídeo junto).
-    const cmd = `yt-dlp --cookies cookies.txt --js-runtimes node --no-playlist -f "bestaudio[acodec=opus]/bestaudio/best" --print "%(title)s\n%(webpage_url)s\n%(uploader)s\n%(acodec)s\n%(thumbnail)s" ${target}`;
+    const cmd = `yt-dlp --cookies cookies.txt --js-runtimes node --no-playlist -f "bestaudio[acodec=opus]/bestaudio/best" --print "%(title)s\n%(webpage_url)s\n%(uploader)s\n%(acodec)s\n%(thumbnail)s\n%(duration)s" ${target}`;
 
     let stdout;
     try {
@@ -55,12 +55,15 @@ async function getAudioMetadata(query, searchEngine = 'ytsearch') {
         throw new Error(`Não foi possível extrair uma URL válida para: ${query}`);
     }
 
+    const duracao = parseFloat(lines[5]);
+
     return {
         title: lines[0],
         url: pageUrl,
         thumbnail: (lines[4] && lines[4] !== 'NA') ? lines[4].trim() : null,
         uploader: lines[2] || "Desconhecido",
-        isOpus: (lines[3] || '').trim() === 'opus'
+        isOpus: (lines[3] || '').trim() === 'opus',
+        duration: Number.isFinite(duracao) ? duracao : null
     };
 }
 
@@ -74,6 +77,7 @@ async function getPlaylistMetadata(playlistUrl) {
         url: entry.url || entry.webpage_url || (entry.id ? `https://www.youtube.com/watch?v=${entry.id}` : null),
         thumbnail: entry.thumbnail || (entry.id ? `https://img.youtube.com/vi/${entry.id}/hqdefault.jpg` : null),
         uploader: entry.uploader || entry.channel || "Desconhecido",
+        duration: entry.duration || null,
         // --flat-playlist não extrai o codec (seria lento demais fazer 1 extração por faixa).
         // null = "desconhecido", o manager assume Opus e tem fallback automático se falhar.
         isOpus: null

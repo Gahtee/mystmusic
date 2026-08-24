@@ -10,18 +10,50 @@ function savePlayLog(guildId, userId, query, title, status, errorMessage = null)
     logsDb.run(sql, [guildId, userId, query, title, status, errorMessage]);
 }
 
-function criarPainelMusical(metadata) {
+function formatarTempo(segundos) {
+    if (segundos === null || segundos === undefined || !Number.isFinite(segundos)) return '--:--';
+    const m = Math.floor(segundos / 60);
+    const s = Math.floor(segundos % 60);
+    return `${m}:${s.toString().padStart(2, '0')}`;
+}
+
+function criarBarraProgresso(elapsedSec, totalSec, tamanho = 20) {
+    if (!totalSec || totalSec <= 0) return '▬'.repeat(tamanho);
+    const proporcao = Math.max(0, Math.min(elapsedSec / totalSec, 1));
+    const posicao = Math.min(tamanho - 1, Math.round(proporcao * (tamanho - 1)));
+    return '▬'.repeat(posicao) + '🔵' + '▬'.repeat(tamanho - posicao - 1);
+}
+
+// Quanto tempo (ms) já tocou da faixa atual, descontando o tempo pausado.
+function calcularElapsedMs(state) {
+    if (!state.playbackStartedAt) return 0;
+    const agora = state.pausedAt || Date.now();
+    return Math.max(0, agora - state.playbackStartedAt - (state.totalPausedMs || 0));
+}
+
+// Extrai o ID de 11 caracteres de uma URL do YouTube (watch?v= ou youtu.be/), usado
+// pelo autoplay para montar a playlist "Mix" (relacionados) a partir da faixa atual.
+function extrairYoutubeId(url) {
+    if (!url) return null;
+    const match = url.match(/(?:v=|youtu\.be\/)([a-zA-Z0-9_-]{11})/);
+    return match ? match[1] : null;
+}
+
+function criarPainelMusical(metadata, elapsedSec = 0) {
+    const barra = criarBarraProgresso(elapsedSec, metadata.duration);
+    const pedidoPor = metadata.requestedBy ? `<@${metadata.requestedBy}>` : '📻 Autoplay';
+
     const embed = new EmbedBuilder()
         .setColor('#5865F2')
         .setTitle('🎶 Tocando Agora')
-        .setDescription(`**[${metadata.title}](${metadata.url})**`)
+        .setDescription(`**[${metadata.title}](${metadata.url})**\n${barra}\n\`${formatarTempo(elapsedSec)} / ${formatarTempo(metadata.duration)}\``)
         .setThumbnail(metadata.thumbnail || null)
         .addFields(
             { name: '📺 Canal', value: metadata.uploader || "Desconhecido", inline: true },
-            { name: '👤 Pedido por', value: `<@${metadata.requestedBy}>`, inline: true }
+            { name: '👤 Pedido por', value: pedidoPor, inline: true }
         )
         .setFooter({ text: 'MystMusic • Controle pelos botões abaixo' });
-    const row = new ActionRowBuilder().addComponents(
+    const row1 = new ActionRowBuilder().addComponents(
         new ButtonBuilder()
             .setCustomId('btn_restart')
             .setLabel('🔄')
@@ -43,8 +75,14 @@ function criarPainelMusical(metadata) {
             .setLabel('❤️ Curtir')
             .setStyle(ButtonStyle.Danger)
     );
+    const row2 = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+            .setCustomId('btn_pauseresume')
+            .setLabel('⏯️ Pausar/Retomar')
+            .setStyle(ButtonStyle.Secondary)
+    );
 
-    return { embeds: [embed], components: [row] };
+    return { embeds: [embed], components: [row1, row2] };
 }
 
 function shuffleQueue(guildId) {
@@ -62,8 +100,13 @@ function shuffleQueue(guildId) {
     return true;
 }
 
-// Gerenciador de painéis (envia o novo e tenta apagar o antigo)
+// Gerenciador de painéis (envia o novo, tenta apagar o antigo, e liga a atualização
+// periódica da barra de progresso)
 async function enviarNovoPainel(channel, state, metadata) {
+    if (state.progressInterval) {
+        clearInterval(state.progressInterval);
+        state.progressInterval = null;
+    }
     if (state.lastPanelMessage) {
         try {
             await state.lastPanelMessage.delete();
@@ -71,8 +114,23 @@ async function enviarNovoPainel(channel, state, metadata) {
             // Ignora se a mensagem já tiver sido apagada manualmente
         }
     }
-    const painel = criarPainelMusical(metadata);
+    const painel = criarPainelMusical(metadata, Math.floor(calcularElapsedMs(state) / 1000));
     state.lastPanelMessage = await channel.send(painel);
+
+    // Só vale a pena atualizar a barra se soubermos a duração da faixa.
+    if (metadata.duration) {
+        state.progressInterval = setInterval(async () => {
+            if (!state.current || !state.lastPanelMessage) return;
+            const elapsedSec = Math.floor(calcularElapsedMs(state) / 1000);
+            try {
+                await state.lastPanelMessage.edit(criarPainelMusical(state.current, elapsedSec));
+            } catch (err) {
+                // Mensagem apagada manualmente ou permissão perdida — para de tentar.
+                clearInterval(state.progressInterval);
+                state.progressInterval = null;
+            }
+        }, 15000);
+    }
 }
 
 // Centraliza a decisão de qual StreamType usar e o retry automático.
@@ -83,6 +141,8 @@ function iniciarReproducao(state, song, forcarTranscodificacao = false) {
         : StreamType.WebmOpus;
 
     state.playbackStartedAt = Date.now();
+    state.pausedAt = null;
+    state.totalPausedMs = 0;
     if (!forcarTranscodificacao) state.fallbackAttempted = false;
 
     const audioStream = getAudioStream(song.url);
@@ -101,6 +161,7 @@ async function garantirMetadadosCompletos(song) {
         song.uploader = completo.uploader;
         song.thumbnail = completo.thumbnail;
         song.isOpus = completo.isOpus;
+        song.duration = completo.duration;
     } catch (err) {
         console.error(`Falha ao completar metadados de ${song.url}:`, err.message);
         song.title = song.title || "Título indisponível";
@@ -190,6 +251,39 @@ async function play(message, query, searchEngine = 'ytsearch') {
 
                     const quemPediu = currentState.current.requestedBy || "Fila Automática";
                     savePlayLog(guildId, quemPediu, currentState.current.query, currentState.current.title, "SUCCESS");
+                } else if (currentState.autoplay) {
+                    // Autoplay: só funciona a partir de uma faixa do YouTube (usamos a
+                    // playlist "Mix"/relacionados dela). SoundCloud não tem equivalente.
+                    const idAtual = extrairYoutubeId(currentState.current?.url);
+                    let relacionadas = [];
+                    if (idAtual) {
+                        try {
+                            const resultado = await getPlaylistMetadata(`https://www.youtube.com/watch?v=${idAtual}&list=RD${idAtual}`);
+                            relacionadas = (resultado.songs || [])
+                                .filter(s => extrairYoutubeId(s.url) !== idAtual)
+                                .slice(0, 5);
+                        } catch (err) {
+                            console.error('Autoplay: falha ao buscar relacionados:', err.message);
+                        }
+                    }
+
+                    if (relacionadas.length > 0) {
+                        relacionadas.forEach(s => { s.requestedBy = null; s.query = s.url; });
+                        currentState.queue.push(...relacionadas);
+                        currentState.current = currentState.queue[0];
+
+                        iniciarReproducao(currentState, currentState.current);
+                        await garantirMetadadosCompletos(currentState.current);
+
+                        if (currentState.textChannel) {
+                            currentState.textChannel.send(`📻 **Autoplay:** adicionei ${relacionadas.length} música(s) relacionada(s) à fila.`).catch(() => {});
+                            await enviarNovoPainel(currentState.textChannel, currentState, currentState.current);
+                        }
+
+                        savePlayLog(guildId, null, currentState.current.query, currentState.current.title, "SUCCESS");
+                    } else {
+                        currentState.current = null;
+                    }
                 } else {
                     currentState.current = null;
                 }
@@ -203,7 +297,11 @@ async function play(message, query, searchEngine = 'ytsearch') {
             queue: [], 
             current: null,
             textChannel: message.channel, // Salva o canal para usar no stateChange
-            lastPanelMessage: null 
+            lastPanelMessage: null,
+            autoplay: false,
+            pausedAt: null,
+            totalPausedMs: 0,
+            progressInterval: null
         };
         states.set(guildId, state);
     }
@@ -318,6 +416,7 @@ async function playNow(message, query) {
 function stop(guildId) {
     const state = states.get(guildId);
     if (!state) return;
+    if (state.progressInterval) clearInterval(state.progressInterval);
     state.queue = [];
     state.current = null;
     state.player.stop();
@@ -332,6 +431,36 @@ function skip(guildId) {
     if (!state || !state.current) return false;
     state.player.stop(); 
     return true;
+}
+
+// Retorna 'pausado' | 'ja_pausado' | 'nada_tocando'
+function pause(guildId) {
+    const state = states.get(guildId);
+    if (!state || !state.current) return 'nada_tocando';
+    if (state.player.state.status === 'paused') return 'ja_pausado';
+    const ok = state.player.pause();
+    if (ok) state.pausedAt = Date.now();
+    return ok ? 'pausado' : 'nada_tocando';
+}
+
+// Retorna 'retomado' | 'nao_pausado' | 'nada_tocando'
+function resume(guildId) {
+    const state = states.get(guildId);
+    if (!state || !state.current) return 'nada_tocando';
+    if (state.player.state.status !== 'paused') return 'nao_pausado';
+    const ok = state.player.unpause();
+    if (ok && state.pausedAt) {
+        state.totalPausedMs = (state.totalPausedMs || 0) + (Date.now() - state.pausedAt);
+        state.pausedAt = null;
+    }
+    return ok ? 'retomado' : 'nada_tocando';
+}
+
+function toggleAutoplay(guildId) {
+    const state = states.get(guildId);
+    if (!state) return null;
+    state.autoplay = !state.autoplay;
+    return state.autoplay;
 }
 
 function restart(guildId) {
@@ -570,167 +699,6 @@ function moverFaixaPlaylist(userId, playlistName, oldPos, newPos) {
     });
 }
 
-function criarPlaylist(userId, name) {
-    return new Promise((resolve, reject) => {
-        playlistDb.run(
-            `INSERT INTO playlists (user_id, name) VALUES (?, ?)`,
-            [userId, name],
-            function (err) {
-                if (err) {
-                    if (err.message.includes('UNIQUE')) return resolve({ status: 'existe' });
-                    return reject(err);
-                }
-                resolve({ status: 'criado' });
-            }
-        );
-    });
-}
-
-function excluirPlaylist(userId, name) {
-    return new Promise((resolve, reject) => {
-        playlistDb.run(
-            `DELETE FROM playlists WHERE user_id = ? AND name = ?`,
-            [userId, name],
-            function (err) {
-                if (err) return reject(err);
-                resolve(this.changes > 0);
-            }
-        );
-    });
-}
-
-function renomearPlaylist(userId, oldName, newName) {
-    return new Promise((resolve, reject) => {
-        playlistDb.run(
-            `UPDATE playlists SET name = ? WHERE user_id = ? AND name = ?`,
-            [newName, userId, oldName],
-            function (err) {
-                if (err) {
-                    if (err.message.includes('UNIQUE')) return resolve({ status: 'duplicado' });
-                    return reject(err);
-                }
-                resolve({ status: this.changes > 0 ? 'sucesso' : 'nao_encontrada' });
-            }
-        );
-    });
-}
-
-async function adicionarFaixaPlaylist(userId, playlistName, query) {
-    const track = await getAudioMetadata(query);
-
-    return new Promise((resolve, reject) => {
-        playlistDb.get(
-            `SELECT id FROM playlists WHERE user_id = ? AND name = ?`,
-            [userId, playlistName],
-            (err, playlist) => {
-                if (err) return reject(err);
-                if (!playlist) return resolve({ status: 'playlist_nao_encontrada' });
-
-                const playlistId = playlist.id;
-
-                playlistDb.get(
-                    `SELECT id FROM playlist_tracks WHERE playlist_id = ? AND url = ?`,
-                    [playlistId, track.url],
-                    (err, existe) => {
-                        if (err) return reject(err);
-                        if (existe) return resolve({ status: 'ja_existe', title: track.title });
-
-                        playlistDb.get(
-                            `SELECT COALESCE(MAX(position), 0) as maxPos FROM playlist_tracks WHERE playlist_id = ?`,
-                            [playlistId],
-                            (err, row) => {
-                                if (err) return reject(err);
-                                const proximaPosicao = row.maxPos + 1;
-
-                                playlistDb.run(
-                                    `INSERT INTO playlist_tracks (playlist_id, title, url, thumbnail, uploader, position) VALUES (?, ?, ?, ?, ?, ?)`,
-                                    [playlistId, track.title, track.url, track.thumbnail, track.uploader, proximaPosicao],
-                                    (err) => {
-                                        if (err) return reject(err);
-                                        resolve({ status: 'adicionado', title: track.title, pos: proximaPosicao });
-                                    }
-                                );
-                            }
-                        );
-                    }
-                );
-            }
-        );
-    });
-}
-
-function removerFaixaPlaylist(userId, playlistName, posicao) {
-    return new Promise((resolve, reject) => {
-        playlistDb.get(
-            `SELECT id FROM playlists WHERE user_id = ? AND name = ?`,
-            [userId, playlistName],
-            (err, playlist) => {
-                if (err) return reject(err);
-                if (!playlist) return resolve({ status: 'playlist_nao_encontrada' });
-
-                const playlistId = playlist.id;
-
-                playlistDb.get(
-                    `SELECT title FROM playlist_tracks WHERE playlist_id = ? AND position = ?`,
-                    [playlistId, posicao],
-                    (err, track) => {
-                        if (err) return reject(err);
-                        if (!track) return resolve({ status: 'posicao_invalida' });
-
-                        playlistDb.serialize(() => {
-                            playlistDb.run(`DELETE FROM playlist_tracks WHERE playlist_id = ? AND position = ?`, [playlistId, posicao]);
-                            playlistDb.run(`UPDATE playlist_tracks SET position = position - 1 WHERE playlist_id = ? AND position > ?`, [playlistId, posicao]);
-                        });
-
-                        resolve({ status: 'removido', title: track.title });
-                    }
-                );
-            }
-        );
-    });
-}
-
-function moverFaixaPlaylist(userId, playlistName, oldPos, newPos) {
-    return new Promise((resolve, reject) => {
-        playlistDb.get(
-            `SELECT id FROM playlists WHERE user_id = ? AND name = ?`,
-            [userId, playlistName],
-            (err, playlist) => {
-                if (err) return reject(err);
-                if (!playlist) return resolve({ status: 'playlist_nao_encontrada' });
-
-                const playlistId = playlist.id;
-
-                playlistDb.get(
-                    `SELECT COUNT(*) as total FROM playlist_tracks WHERE playlist_id = ?`,
-                    [playlistId],
-                    (err, row) => {
-                        if (err) return reject(err);
-                        if (oldPos < 1 || oldPos > row.total || newPos < 1 || newPos > row.total) {
-                            return resolve({ status: 'fora_dos_limites', total: row.total });
-                        }
-
-                        if (oldPos === newPos) return resolve({ status: 'mesma_posicao' });
-                        playlistDb.serialize(() => {
-                            playlistDb.run(`UPDATE playlist_tracks SET position = -1 WHERE playlist_id = ? AND position = ?`, [playlistId, oldPos]);
-
-                            if (oldPos > newPos) {
-                                playlistDb.run(`UPDATE playlist_tracks SET position = position + 1 WHERE playlist_id = ? AND position >= ? AND position < ?`, [playlistId, newPos, oldPos]);
-                            } else {
-                                playlistDb.run(`UPDATE playlist_tracks SET position = position - 1 WHERE playlist_id = ? AND position > ? AND position <= ?`, [playlistId, oldPos, newPos]);
-                            }
-                            playlistDb.run(`UPDATE playlist_tracks SET position = ? WHERE playlist_id = ? AND position = -1`, [newPos, playlistId], (err) => {
-                                if (err) return reject(err);
-                                resolve({ status: 'sucesso' });
-                            });
-                        });
-                    }
-                );
-            }
-        );
-    });
-}
-
 function listarPlaylist(userId, playlistName) {
     return new Promise((resolve, reject) => {
         playlistDb.get(
@@ -810,4 +778,4 @@ function listarTodasPlaylists(userId) {
     });
 }
 
-module.exports = { play, stop, skip, restart, playNow, criarPainelMusical, adicionarAosCurtidos, shuffleQueue,  criarPlaylist, excluirPlaylist, renomearPlaylist, adicionarFaixaPlaylist, removerFaixaPlaylist, moverFaixaPlaylist, tocarPlaylist, listarPlaylist, listarTodasPlaylists, states };
+module.exports = { play, stop, skip, restart, pause, resume, toggleAutoplay, playNow, criarPainelMusical, adicionarAosCurtidos, shuffleQueue,  criarPlaylist, excluirPlaylist, renomearPlaylist, adicionarFaixaPlaylist, removerFaixaPlaylist, moverFaixaPlaylist, tocarPlaylist, listarPlaylist, listarTodasPlaylists, states };

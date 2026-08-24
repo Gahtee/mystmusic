@@ -16,6 +16,9 @@ const {
   stop,
   skip,
   restart,
+  pause,
+  resume,
+  toggleAutoplay,
   playNow,
   criarPainelMusical,
   adicionarAosCurtidos,
@@ -402,6 +405,28 @@ client.on("messageCreate", async (message) => {
     } else {
       message.reply("❌ Não tem nenhuma música tocando para eu reiniciar.");
     }
+  }
+
+  if (message.content.startsWith("!pause")) {
+    const resultado = pause(message.guild.id);
+    if (resultado === "pausado") message.reply("⏸️ Música pausada.");
+    else if (resultado === "ja_pausado") message.reply("⏸️ Já estava pausada.");
+    else message.reply("❌ Não tem nenhuma música tocando para pausar.");
+  }
+
+  if (message.content.startsWith("!resume")) {
+    const resultado = resume(message.guild.id);
+    if (resultado === "retomado") message.reply("▶️ Música retomada.");
+    else if (resultado === "nao_pausado") message.reply("▶️ A música já está tocando.");
+    else message.reply("❌ Não tem nenhuma música tocando para retomar.");
+  }
+
+  if (message.content.startsWith("!autoplay")) {
+    const ativado = toggleAutoplay(message.guild.id);
+    if (ativado === null) return message.reply("❌ Não há nenhuma sessão de música ativa neste servidor.");
+    message.reply(ativado
+      ? "📻 Autoplay **ativado** — quando a fila acabar, eu continuo com músicas relacionadas (baseado na última do YouTube tocada)."
+      : "📻 Autoplay **desativado**.");
   }
 
   if (message.content.startsWith("!np")) {
@@ -859,6 +884,7 @@ client.on("interactionCreate", async (interaction) => {
         "btn_restart",
         "btn_shuffle",
         "btn_like",
+        "btn_pauseresume",
       ].includes(interaction.customId)
     ) {
       if (!state || !state.current) {
@@ -892,6 +918,24 @@ client.on("interactionCreate", async (interaction) => {
           await interaction.deferUpdate();
           restart(guildId);
           break;
+
+        case "btn_pauseresume": {
+          const pausado = state.player.state.status === "paused";
+          if (pausado) {
+            const r = resume(guildId);
+            await interaction.reply({
+              content: r === "retomado" ? "▶️ Retomado!" : "❌ Não foi possível retomar.",
+              ephemeral: true,
+            });
+          } else {
+            const r = pause(guildId);
+            await interaction.reply({
+              content: r === "pausado" ? "⏸️ Pausado!" : "❌ Não foi possível pausar.",
+              ephemeral: true,
+            });
+          }
+          break;
+        }
 
         case "btn_shuffle":
           const embaralhou = shuffleQueue(guildId);

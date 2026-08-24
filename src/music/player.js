@@ -8,7 +8,7 @@ function playStream(player, audioStream, streamType = StreamType.WebmOpus) {
 
     const resource = createAudioResource(audioStream, {
         inputType: streamType,
-        inlineVolume: true
+        inlineVolume: false
     });
 
     resource.playStream.on('error', error => console.error('[STREAM ERROR]', error));
