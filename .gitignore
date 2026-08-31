@@ -1,4 +1,5 @@
 /.env
 /cookies.txt
-/db/
+/db/logs.db
+/db/playlists.db
 node_modules/

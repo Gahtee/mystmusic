@@ -2,8 +2,6 @@ const { spawn, exec } = require('child_process');
 const util = require('util');
 const execPromise = util.promisify(exec);
 
-// Traduz os erros mais comuns do yt-dlp (stderr) pra uma mensagem clara pro usuário.
-// Se não reconhecer o padrão, devolve a primeira linha de erro do próprio yt-dlp.
 function friendlyExtractionError(err, query) {
     const stderr = err.stderr || '';
 
@@ -26,9 +24,6 @@ function friendlyExtractionError(err, query) {
         : `Falha ao buscar "${query}".`);
 }
 
-// searchEngine: "ytsearch" (padrão, YouTube) ou "scsearch" (SoundCloud) — só é usado
-// quando "query" não é uma URL. Se for uma URL (YouTube OU SoundCloud), o yt-dlp
-// detecta o site sozinho pelo domínio.
 async function getAudioMetadata(query, searchEngine = 'ytsearch') {
     let target;
     if (query.startsWith('http://') || query.startsWith('https://')) {
@@ -36,9 +31,7 @@ async function getAudioMetadata(query, searchEngine = 'ytsearch') {
     } else {
         target = `"${searchEngine}1:${query}"`;
     }
-    // Seletor com 3 níveis: opus puro (ideal) → qualquer áudio puro → formato combinado
-    // vídeo+áudio como último recurso (alguns vídeos ficam sem NENHUM "bestaudio" por
-    // causa do SABR do YouTube, e só sobra um formato tipo "18", com vídeo junto).
+
     const cmd = `yt-dlp --cookies cookies.txt --js-runtimes node --no-playlist -f "bestaudio[acodec=opus]/bestaudio/best" --print "%(title)s\n%(webpage_url)s\n%(uploader)s\n%(acodec)s\n%(thumbnail)s\n%(duration)s" ${target}`;
 
     let stdout;
@@ -68,9 +61,15 @@ async function getAudioMetadata(query, searchEngine = 'ytsearch') {
 }
 
 async function getPlaylistMetadata(playlistUrl) {
-    const cmd = `yt-dlp --cookies cookies.txt --js-runtimes node --flat-playlist --dump-single-json "${playlistUrl}"`;
-    
-    const { stdout } = await execPromise(cmd);
+
+    const cmd = `yt-dlp --cookies cookies.txt --js-runtimes node --flat-playlist --playlist-end 100 --dump-single-json "${playlistUrl}"`;
+
+    let stdout;
+    try {
+        ({ stdout } = await execPromise(cmd, { maxBuffer: 1024 * 1024 * 20 }));
+    } catch (err) {
+        throw friendlyExtractionError(err, playlistUrl);
+    }
     const playlistData = JSON.parse(stdout);
     const songs = playlistData.entries.map(entry => ({
         title: entry.title,
@@ -78,8 +77,7 @@ async function getPlaylistMetadata(playlistUrl) {
         thumbnail: entry.thumbnail || (entry.id ? `https://img.youtube.com/vi/${entry.id}/hqdefault.jpg` : null),
         uploader: entry.uploader || entry.channel || "Desconhecido",
         duration: entry.duration || null,
-        // --flat-playlist não extrai o codec (seria lento demais fazer 1 extração por faixa).
-        // null = "desconhecido", o manager assume Opus e tem fallback automático se falhar.
+
         isOpus: null
     }));
 

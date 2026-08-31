@@ -154,7 +154,7 @@ function iniciarReproducao(state, song, forcarTranscodificacao = false) {
 // conhecida do yt-dlp). Se estiver faltando, busca os metadados completos AGORA — só
 // dessa faixa, não da playlist inteira, então não impacta o tempo de adicionar à fila.
 async function garantirMetadadosCompletos(song) {
-    if (song.title) return song;
+    if (song.title && song.duration) return song;
     try {
         const completo = await getAudioMetadata(song.url);
         song.title = completo.title;
@@ -607,8 +607,8 @@ async function adicionarFaixaPlaylist(userId, playlistName, query) {
                                 const proximaPosicao = row.maxPos + 1;
 
                                 playlistDb.run(
-                                    `INSERT INTO playlist_tracks (playlist_id, title, url, thumbnail, uploader, position) VALUES (?, ?, ?, ?, ?, ?)`,
-                                    [playlistId, track.title, track.url, track.thumbnail, track.uploader, proximaPosicao],
+                                    `INSERT INTO playlist_tracks (playlist_id, title, url, thumbnail, uploader, duration, position) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+                                    [playlistId, track.title, track.url, track.thumbnail, track.uploader, track.duration, proximaPosicao],
                                     (err) => {
                                         if (err) return reject(err);
                                         resolve({ status: 'adicionado', title: track.title, pos: proximaPosicao });
@@ -748,6 +748,7 @@ function tocarPlaylist(message, userId, playlistName) {
                                         url: track.url,
                                         thumbnail: track.thumbnail,
                                         uploader: track.uploader,
+                                        duration: track.duration,
                                         requestedBy: message.author.id
                                     });
                                 });

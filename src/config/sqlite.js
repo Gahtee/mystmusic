@@ -32,6 +32,13 @@ playlistDb.serialize(() => {
   playlistDb.exec(playlistSchema, (err) => {
     if (err) console.error("Erro ao criar tabela de playlists:", err.message);
   });
+  // Migração: adiciona a coluna "duration" em bancos criados antes dela existir.
+  // ALTER TABLE ADD COLUMN dá erro se a coluna já existe — nesse caso é esperado, ignora.
+  playlistDb.run(`ALTER TABLE playlist_tracks ADD COLUMN duration INTEGER`, (err) => {
+    if (err && !/duplicate column name/i.test(err.message)) {
+      console.error("Erro na migração da coluna 'duration':", err.message);
+    }
+  });
 });
 
 // Exporta as duas instâncias para usar no restante do bot
