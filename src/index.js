@@ -117,7 +117,8 @@ function criarPainelFila(state, pagina = 0) {
 
 client.on("messageCreate", async (message) => {
   if (message.author.bot || !message.guild) return;
-  if (message.content.startsWith("!playnow")) {
+  if (message.content.startsWith("!playnow") || message.content.startsWith("!playnext"))
+    {
     const query = message.content.replace("!playnow", "").trim();
     if (!query)
       return message.reply("Nome ou o link da música que vai furar a fila!");
