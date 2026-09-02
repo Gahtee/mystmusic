@@ -23,6 +23,9 @@ const {
   criarPainelMusical,
   adicionarAosCurtidos,
   shuffleQueue,
+  removeFromQueue,
+  seek,
+  parseSeekInput,
   criarPlaylist,
   excluirPlaylist,
   renomearPlaylist,
@@ -32,6 +35,7 @@ const {
   tocarPlaylist,
   listarPlaylist,
   listarTodasPlaylists,
+  listarPlaylistsDoServidor,
   states,
 } = require("./music/manager");
 const { logsDb, playlistDb } = require("./config/sqlite");
@@ -123,6 +127,89 @@ client.on("messageCreate", async (message) => {
     if (!query)
       return message.reply("Nome ou o link da música que vai furar a fila!");
     return playNow(message, query);
+  }
+
+  // ── Playlists de outros membros ────────────────────────────────────────────
+
+  // !playlists servidor  →  apanhado geral de todas as playlists do servidor
+  if (
+    message.content === "!playlists servidor" ||
+    message.content === "!playlists server"
+  ) {
+    const grupos = await listarPlaylistsDoServidor();
+
+    if (!grupos || grupos.length === 0) {
+      return message.reply("📭 Nenhuma playlist criada no servidor ainda.");
+    }
+
+    // Resolve nomes de usuário via cache do guild (sem precisar de fetch extra)
+    const linhas = [];
+    for (const { user_id, playlists } of grupos) {
+      const membro = message.guild.members.cache.get(user_id);
+      const nome = membro ? membro.displayName : `<@${user_id}>`;
+      const itens = playlists
+        .map(p => p.name.toLowerCase() === "curtidas"
+          ? `❤️ ${p.name} (${p.total_musicas})`
+          : `📁 ${p.name} (${p.total_musicas})`)
+        .join("  ·  ");
+      linhas.push(`**${nome}** — ${itens}`);
+    }
+
+    // Discord limita embeds a 4096 chars; manda em blocos se necessário
+    const cabecalho = "📋 **Playlists do servidor:**\n\n";
+    const corpo = linhas.join("\n");
+    const rodape = "\n\n*Use `!playlists @usuario` para ver detalhes · `!playlist tocar @usuario \"Nome\"` para tocar*";
+
+    const mensagem = cabecalho + corpo + rodape;
+    if (mensagem.length <= 2000) {
+      return message.reply(mensagem);
+    }
+
+    // Muito longo: divide em partes
+    let parte = cabecalho;
+    for (const linha of linhas) {
+      if ((parte + linha + "\n").length > 1950) {
+        await message.channel.send(parte.trimEnd());
+        parte = "";
+      }
+      parte += linha + "\n";
+    }
+    if (parte.trim()) await message.channel.send(parte.trimEnd());
+    return message.channel.send(rodape.trim());
+  }
+
+  // !playlists @usuario  →  lista as playlists de outro membro
+  if (message.content.startsWith("!playlists")) {
+    const mencionado = message.mentions.users.first();
+
+    // Se não mencionou ninguém, redireciona para o próprio usuário
+    if (!mencionado || mencionado.id === message.author.id) {
+      const playlists = await listarTodasPlaylists(message.author.id);
+      if (!playlists || playlists.length === 0) {
+        return message.reply('📭 Você ainda não tem nenhuma playlist. Use `!playlist criar "Nome"` para começar!');
+      }
+      const lista = playlists
+        .map(p => p.name.toLowerCase() === "curtidas"
+          ? `❤️ **${p.name}** (${p.total_musicas} músicas)`
+          : `📁 **${p.name}** (${p.total_musicas} músicas)`)
+        .join("\n");
+      return message.reply(`📋 **Suas playlists:**\n\n${lista}\n\n*Para tocar: \`!playlist tocar "Nome"\`*`);
+    }
+
+    // Listando playlists de outra pessoa
+    const playlists = await listarTodasPlaylists(mencionado.id);
+    if (!playlists || playlists.length === 0) {
+      return message.reply(`📭 **${mencionado.displayName}** ainda não tem nenhuma playlist criada.`);
+    }
+    const lista = playlists
+      .map(p => p.name.toLowerCase() === "curtidas"
+        ? `❤️ **${p.name}** (${p.total_musicas} músicas)`
+        : `📁 **${p.name}** (${p.total_musicas} músicas)`)
+      .join("\n");
+    return message.reply(
+      `📋 **Playlists de ${mencionado.displayName}:**\n\n${lista}\n\n` +
+      `*Para tocar: \`!playlist tocar @${mencionado.username} "Nome"\`*`
+    );
   }
 
   if (message.content.startsWith("!playlist")) {
@@ -337,10 +424,21 @@ client.on("messageCreate", async (message) => {
       }
 
       case "tocar": {
-        const playlistName = args[1];
+        // Suporte a !playlist tocar @usuario "Nome"
+        const mencionado = message.mentions.users.first();
+        let donoId = userId;
+        let playlistName = args[1];
+
+        if (mencionado && mencionado.id !== message.author.id) {
+          donoId = mencionado.id;
+          playlistName = args[2]; // nome vem depois da menção
+        }
+
         if (!playlistName)
           return message.reply(
-            '❌ Digite o nome da playlist. Ex: `!playlist tocar "Curtidas"`',
+            '❌ Digite o nome da playlist.\n' +
+            'Sua playlist: `!playlist tocar "Nome"`\n' +
+            'De outro membro: `!playlist tocar @usuario "Nome"`',
           );
 
         if (!message.member.voice.channelId)
@@ -348,17 +446,23 @@ client.on("messageCreate", async (message) => {
             "❌ Você precisa estar em um canal de voz para tocar a playlist!",
           );
 
+        const donoLabel = (mencionado && mencionado.id !== message.author.id)
+          ? `de **${mencionado.displayName}**`
+          : `**${playlistName}**`;
+
         const msgAviso = await message.reply(
-          `⏳ Carregando as músicas de **${playlistName}** para a fila...`,
+          `⏳ Carregando as músicas da playlist ${donoLabel} para a fila...`,
         );
         try {
-          const sucesso = await tocarPlaylist(message, userId, playlistName);
+          const sucesso = await tocarPlaylist(message, donoId, playlistName);
           if (!sucesso)
             return msgAviso.edit(
-              `❌ Playlist **${playlistName}** não encontrada ou vazia.`,
+              (mencionado && mencionado.id !== message.author.id)
+                ? `❌ **${mencionado.displayName}** não tem uma playlist chamada **${playlistName}** (ou está vazia).`
+                : `❌ Playlist **${playlistName}** não encontrada ou vazia.`,
             );
           return msgAviso.edit(
-            `▶️ Playlist **${playlistName}** adicionada à fila com sucesso!`,
+            `▶️ Playlist ${donoLabel} adicionada à fila com sucesso!`,
           );
         } catch (error) {
           console.error("Erro ao tocar playlist:", error);
@@ -369,6 +473,7 @@ client.on("messageCreate", async (message) => {
       }
     }
   }
+
   if (message.content.startsWith("!playsc")) {
     const query = message.content.replace("!playsc", "").trim();
     if (!query) return message.reply("Nome ou o link da música do SoundCloud!");
@@ -484,6 +589,115 @@ client.on("messageCreate", async (message) => {
       );
     }
   }
+  if (message.content.startsWith("!seek")) {
+    const args = message.content.split(/\s+/);
+    if (!args[1]) {
+      return message.reply(
+        "❌ Use `!seek <tempo>`. Exemplos:\n" +
+        "`!seek 10:20` → 10 min 20 s\n" +
+        "`!seek 1:12:14` → 1 h 12 min 14 s\n" +
+        "`!seek 15` → 15 min\n" +
+        "`!seek 00:15` → 15 s"
+      );
+    }
+
+    const seekSec = parseSeekInput(args[1]);
+    if (seekSec === null || seekSec < 0) {
+      return message.reply("❌ Tempo inválido. Use formatos como `10:20`, `1:12:14`, `00:15` ou `15`.");
+    }
+
+    return seek(message.guild.id, seekSec, message);
+  }
+
+  if (message.content.startsWith("!remove")) {
+    const args = message.content.split(/\s+/);
+    const posicao = parseInt(args[1]);
+
+    if (isNaN(posicao) || posicao < 1) {
+      return message.reply("❌ Use `!remove <número>` — o número da música na fila (veja com `!queue`).");
+    }
+
+    const state = states.get(message.guild.id);
+    if (!state || state.queue.length <= 1) {
+      return message.reply("❌ Não há músicas na fila para remover.");
+    }
+
+    if (posicao >= state.queue.length) {
+      return message.reply(`❌ Posição inválida. A fila tem **${state.queue.length - 1}** música(s).`);
+    }
+
+    const titulo = removeFromQueue(message.guild.id, posicao);
+    if (titulo) {
+      return message.reply(`🗑️ **${titulo}** (posição #${posicao}) removida da fila.`);
+    } else {
+      return message.reply("❌ Não foi possível remover essa música.");
+    }
+  }
+
+  if (message.content === "!help" || message.content === "!comandos") {
+    const embed = new EmbedBuilder()
+      .setColor("#5865F2")
+      .setTitle("🎵 MystMusic — Comandos Disponíveis")
+      .addFields(
+        {
+          name: "▶️ Reprodução",
+          value:
+            "`!play <nome/link>` — Adiciona música à fila (YouTube)\n" +
+            "`!playsc <nome/link>` — Adiciona música à fila (SoundCloud)\n" +
+            "`!playnow <nome/link>` — Fura a fila e toca imediatamente\n" +
+            "`!stop` — Para tudo e esvazia a fila\n" +
+            "`!skip` — Pula para a próxima música\n" +
+            "`!restart` — Reinicia a música atual do começo\n" +
+            "`!pause` — Pausa a reprodução\n" +
+            "`!resume` — Retoma a reprodução",
+        },
+        {
+          name: "📋 Fila",
+          value:
+            "`!queue` / `!fila` — Mostra as músicas na fila\n" +
+            "`!remove <número>` — Remove uma música da fila pelo número\n" +
+            "`!seek <tempo>` — Vai para um trecho da música (ex: `10:20`, `1:12:14`, `00:15`, `15`)\n" +
+            "`!shuffle` / `!misturar` — Embaralha a fila\n" +
+            "`!np` — Mostra o painel da música atual",
+        },
+        {
+          name: "📻 Autoplay & Histórico",
+          value:
+            "`!autoplay` — Ativa/desativa o autoplay ao fim da fila\n" +
+            "`!history` / `!historico` — Histórico de músicas tocadas",
+        },
+        {
+          name: "📁 Playlists",
+          value:
+            '`!playlist criar "Nome"` — Cria uma playlist\n' +
+            '`!playlist excluir "Nome"` — Exclui uma playlist\n' +
+            '`!playlist renomear "Antigo" "Novo"` — Renomeia\n' +
+            '`!playlist add "Nome" <música>` — Adiciona faixa\n' +
+            '`!playlist remover "Nome" <posição>` — Remove faixa\n' +
+            '`!playlist mover "Nome" <de> <para>` — Move faixa\n' +
+            '`!playlist listar` — Lista suas playlists\n' +
+            '`!playlist listar "Nome"` — Lista faixas de uma playlist\n' +
+            '`!playlist tocar "Nome"` — Toca uma playlist\n' +
+            '`!playlist tocar @usuario "Nome"` — Toca a playlist de outro membro',
+        },
+        {
+          name: "👥 Playlists de outros membros",
+          value:
+            '`!playlists @usuario` — Lista as playlists de outro membro\n' +
+            '`!playlist tocar @usuario "Nome"` — Toca a playlist de outro membro',
+        },
+        {
+          name: "🔧 Outros",
+          value:
+            "`!botmorreu` / `!botbosta` — Reinicia o bot\n" +
+            "`!help` / `!comandos` — Mostra esta mensagem",
+        }
+      )
+      .setFooter({ text: "MystMusic • Use os botões do painel para controle rápido" });
+
+    return message.channel.send({ embeds: [embed] });
+  }
+
   if (
     message.content.startsWith("!botmorreu") ||
     message.content.startsWith("!botbosta")

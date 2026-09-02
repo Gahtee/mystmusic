@@ -87,7 +87,7 @@ async function getPlaylistMetadata(playlistUrl) {
     };
 }
 
-function getAudioStream(url) {
+function getAudioStream(url, seekSec = 0) {
     const args = [
         '--cookies', 'cookies.txt',
         '-f', 'bestaudio[acodec=opus]/bestaudio/best',
@@ -96,8 +96,44 @@ function getAudioStream(url) {
         '--no-playlist',
         '--quiet',
         '--no-warnings',
-        url
     ];
+
+    // Quando há seek, adicionamos -ss via ffmpeg (mais confiável que --download-sections
+    // para streams ao vivo e formatos não-WebM). O yt-dlp emite o áudio bruto e o
+    // ffmpeg corta e re-codifica para Opus/ogg que o Discord entende sem problemas.
+    if (seekSec > 0) {
+        args.push(url);
+        const ytProcess = spawn('yt-dlp', args);
+        ytProcess.stderr.on('data', d => console.error(`[yt-dlp seek error]: ${d}`));
+        ytProcess.on('error', err => console.error('[SPAWN ERROR yt-dlp seek]:', err));
+
+        // ffmpeg lê stdin (yt-dlp), pula seekSec segundos e emite Opus em ogg
+        const ffArgs = [
+            '-i', 'pipe:0',
+            '-ss', String(seekSec),
+            '-acodec', 'libopus',
+            '-f', 'opus',
+            '-vn',
+            'pipe:1',
+        ];
+        const ffProcess = spawn('ffmpeg', ffArgs, { stdio: ['pipe', 'pipe', 'pipe'] });
+        ffProcess.stderr.on('data', d => {
+            const msg = d.toString();
+            // Ignora linhas de progresso normais do ffmpeg
+            if (!msg.includes('frame=') && !msg.includes('size=')) {
+                console.error(`[ffmpeg seek error]: ${msg}`);
+            }
+        });
+        ffProcess.on('error', err => console.error('[SPAWN ERROR ffmpeg seek]:', err));
+
+        ytProcess.stdout.pipe(ffProcess.stdin);
+        ytProcess.stdout.on('error', () => ffProcess.stdin.destroy());
+        ffProcess.stdin.on('error', () => {}); // evita crash por broken pipe
+
+        return ffProcess.stdout;
+    }
+
+    args.push(url);
 
     const ytProcess = spawn('yt-dlp', args);
 

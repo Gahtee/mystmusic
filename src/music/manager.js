@@ -103,6 +103,10 @@ function shuffleQueue(guildId) {
 // Gerenciador de painéis (envia o novo, tenta apagar o antigo, e liga a atualização
 // periódica da barra de progresso)
 async function enviarNovoPainel(channel, state, metadata) {
+    if (state.progressTimeout) {
+        clearTimeout(state.progressTimeout);
+        state.progressTimeout = null;
+    }
     if (state.progressInterval) {
         clearInterval(state.progressInterval);
         state.progressInterval = null;
@@ -118,34 +122,40 @@ async function enviarNovoPainel(channel, state, metadata) {
     state.lastPanelMessage = await channel.send(painel);
 
     // Só vale a pena atualizar a barra se soubermos a duração da faixa.
+    // Delay de 10s antes de começar o intervalo, para compensar o tempo entre o
+    // envio da mensagem e o início real da reprodução no Discord.
     if (metadata.duration) {
-        state.progressInterval = setInterval(async () => {
-            if (!state.current || !state.lastPanelMessage) return;
-            const elapsedSec = Math.floor(calcularElapsedMs(state) / 1000);
-            try {
-                await state.lastPanelMessage.edit(criarPainelMusical(state.current, elapsedSec));
-            } catch (err) {
-                // Mensagem apagada manualmente ou permissão perdida — para de tentar.
-                clearInterval(state.progressInterval);
-                state.progressInterval = null;
-            }
-        }, 15000);
+        state.progressTimeout = setTimeout(() => {
+            state.progressInterval = setInterval(async () => {
+                if (!state.current || !state.lastPanelMessage) return;
+                const elapsedSec = Math.floor(calcularElapsedMs(state) / 1000);
+                try {
+                    await state.lastPanelMessage.edit(criarPainelMusical(state.current, elapsedSec));
+                } catch (err) {
+                    // Mensagem apagada manualmente ou permissão perdida — para de tentar.
+                    clearInterval(state.progressInterval);
+                    state.progressInterval = null;
+                }
+            }, 15000);
+        }, 10000);
     }
 }
 
 // Centraliza a decisão de qual StreamType usar e o retry automático.
 // song.isOpus: true (confirmado), false (confirmado outro codec) ou null/undefined (desconhecido, ex: playlists).
-function iniciarReproducao(state, song, forcarTranscodificacao = false) {
-    const streamType = (forcarTranscodificacao || song.isOpus === false)
+function iniciarReproducao(state, song, forcarTranscodificacao = false, seekSec = 0) {
+    // Seek sempre força transcodificação (--download-sections quebra o Opus nativo).
+    const streamType = (forcarTranscodificacao || seekSec > 0 || song.isOpus === false)
         ? StreamType.Arbitrary
         : StreamType.WebmOpus;
 
-    state.playbackStartedAt = Date.now();
+    // Ajusta o relógio interno para que o timer reflita a posição real na faixa.
+    state.playbackStartedAt = Date.now() - (seekSec * 1000);
     state.pausedAt = null;
     state.totalPausedMs = 0;
     if (!forcarTranscodificacao) state.fallbackAttempted = false;
 
-    const audioStream = getAudioStream(song.url);
+    const audioStream = getAudioStream(song.url, seekSec);
     playStream(state.player, audioStream, streamType);
 }
 
@@ -301,7 +311,8 @@ async function play(message, query, searchEngine = 'ytsearch') {
             autoplay: false,
             pausedAt: null,
             totalPausedMs: 0,
-            progressInterval: null
+            progressInterval: null,
+            progressTimeout: null
         };
         states.set(guildId, state);
     }
@@ -416,6 +427,7 @@ async function playNow(message, query) {
 function stop(guildId) {
     const state = states.get(guildId);
     if (!state) return;
+    if (state.progressTimeout) { clearTimeout(state.progressTimeout); state.progressTimeout = null; }
     if (state.progressInterval) clearInterval(state.progressInterval);
     state.queue = [];
     state.current = null;
@@ -779,4 +791,108 @@ function listarTodasPlaylists(userId) {
     });
 }
 
-module.exports = { play, stop, skip, restart, pause, resume, toggleAutoplay, playNow, criarPainelMusical, adicionarAosCurtidos, shuffleQueue,  criarPlaylist, excluirPlaylist, renomearPlaylist, adicionarFaixaPlaylist, removerFaixaPlaylist, moverFaixaPlaylist, tocarPlaylist, listarPlaylist, listarTodasPlaylists, states };
+// Retorna todas as playlists do servidor agrupadas por user_id.
+// Resultado: [{ user_id: '123', playlists: [{ name: 'Rock', total_musicas: 5 }, ...] }, ...]
+function listarPlaylistsDoServidor() {
+    return new Promise((resolve, reject) => {
+        playlistDb.all(
+            `SELECT p.user_id, p.name, COUNT(t.id) as total_musicas
+             FROM playlists p
+             LEFT JOIN playlist_tracks t ON p.id = t.playlist_id
+             GROUP BY p.id
+             ORDER BY p.user_id, p.name ASC`,
+            [],
+            (err, rows) => {
+                if (err) return reject(err);
+                // Agrupa por user_id
+                const map = new Map();
+                for (const row of rows) {
+                    if (!map.has(row.user_id)) map.set(row.user_id, []);
+                    map.get(row.user_id).push({ name: row.name, total_musicas: row.total_musicas });
+                }
+                resolve([...map.entries()].map(([user_id, playlists]) => ({ user_id, playlists })));
+            }
+        );
+    });
+}
+
+// Converte string de tempo para segundos.
+// Formatos aceitos:
+//   "15"         → 15 min (sem separador = minutos por convenção do bot)
+//   "1:30"       → 1 min 30 s   (MM:SS ou H:MM dependendo do contexto)
+//   "10:20"      → 10 min 20 s
+//   "1:12:14"    → 1 h 12 min 14 s
+//   "00:15"      → 15 s   (zero à esquerda indica segundos)
+//   "00:00:15"   → 15 s
+//
+// Regra para dois segmentos (A:B):
+//   Se A === 0  → resultado = B segundos  (ex: 00:15 → 15 s)
+//   Caso contrário → resultado = A*60 + B segundos (ex: 10:20 → 620 s)
+function parseSeekInput(input) {
+    input = input.trim();
+
+    // Sem ":" — número sozinho → minutos
+    if (!input.includes(':')) {
+        const n = parseInt(input, 10);
+        return isNaN(n) ? null : n * 60;
+    }
+
+    const partes = input.split(':').map(p => parseInt(p, 10));
+    if (partes.some(isNaN)) return null;
+
+    if (partes.length === 3) {
+        // H:MM:SS
+        const [h, m, s] = partes;
+        return h * 3600 + m * 60 + s;
+    }
+
+    if (partes.length === 2) {
+        const [a, b] = partes;
+        // Se o primeiro segmento é 0 → só segundos (00:15 → 15 s)
+        if (a === 0) return b;
+        // Caso contrário → MM:SS
+        return a * 60 + b;
+    }
+
+    return null;
+}
+
+// Faz seek na música atual: reinicia o stream a partir de seekSec segundos.
+async function seek(guildId, seekSec, message) {
+    const state = states.get(guildId);
+    if (!state || !state.current) {
+        return message.reply("❌ Nenhuma música tocando no momento.");
+    }
+
+    const song = state.current;
+    if (song.duration && seekSec >= song.duration) {
+        return message.reply("❌ Posição além da duração da música.");
+    }
+
+    const minutos = Math.floor(seekSec / 60);
+    const segundos = seekSec % 60;
+    const label = song.duration
+        ? `${minutos}:${String(segundos).padStart(2, '0')} / ${Math.floor(song.duration / 60)}:${String(Math.floor(song.duration % 60)).padStart(2, '0')}`
+        : `${minutos}:${String(segundos).padStart(2, '0')}`;
+
+    await message.reply(`⏩ Indo para **${label}** em *${song.title}*...`);
+
+    iniciarReproducao(state, song, true, seekSec);
+    await enviarNovoPainel(state.textChannel, state, song);
+}
+
+// Remove uma música da fila pelo número exibido no !queue (1 = próxima, não a atual).
+// Retorna o título da música removida, ou null se a posição for inválida.
+function removeFromQueue(guildId, posicao) {
+    const state = states.get(guildId);
+    if (!state || state.queue.length <= 1) return null; // índice 0 é a atual
+
+    // posicao 1 → queue[1], posicao 2 → queue[2], ...
+    const idx = posicao; // já é o índice real no array (0 = atual)
+    if (idx < 1 || idx >= state.queue.length) return null;
+
+    const [removida] = state.queue.splice(idx, 1);
+    return removida.title;
+}
+
+module.exports = { play, stop, skip, restart, pause, resume, toggleAutoplay, playNow, criarPainelMusical, adicionarAosCurtidos, shuffleQueue, removeFromQueue, seek, parseSeekInput, criarPlaylist, excluirPlaylist, renomearPlaylist, adicionarFaixaPlaylist, removerFaixaPlaylist, moverFaixaPlaylist, tocarPlaylist, listarPlaylist, listarTodasPlaylists, listarPlaylistsDoServidor, states };
