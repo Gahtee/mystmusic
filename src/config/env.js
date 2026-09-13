@@ -6,6 +6,6 @@ module.exports = {
   SECRET: process.env.SECRET,
   CLIENT: process.env.CLIENT,
   GUILDS: process.env.GUILDS
-    ? process.env.GUILDS.split(",").map(id => id.trim())
-    : []
+    ? process.env.GUILDS.split(",").map((id) => id.trim())
+    : [],
 };

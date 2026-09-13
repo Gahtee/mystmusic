@@ -77,7 +77,8 @@ function criarPainelFila(state, pagina = 0) {
     return { embeds: [embed], components: [] };
   }
   // Autoplay tem requestedBy null — evita renderizar <@null> / <@undefined>.
-  const rotuloPedido = (faixa) => faixa && faixa.requestedBy ? `<@${faixa.requestedBy}>` : "📻 Autoplay";
+  const rotuloPedido = (faixa) =>
+    faixa && faixa.requestedBy ? `<@${faixa.requestedBy}>` : "📻 Autoplay";
   let descricao = `**Tocando Agora:**\n🔹 [${current.title}](${current.url}) | ${rotuloPedido(current)}\n\n`;
 
   if (queue.length > 1) {
@@ -144,16 +145,22 @@ function fakeMessageFromInteraction(interaction, { deferred = false } = {}) {
     reply: async (content) => {
       const payload = typeof content === "string" ? { content } : content;
       // Guarda o título resolvido para o handler encerrar o defer com contexto.
-      const titulo = payload?.embeds?.[0]?.data?.title
-        || (typeof payload?.content === "string" && payload.content.slice(0, 80))
-        || null;
+      const titulo =
+        payload?.embeds?.[0]?.data?.title ||
+        (typeof payload?.content === "string" &&
+          payload.content.slice(0, 80)) ||
+        null;
       if (typeof interaction._slashLastTitle === "undefined" || titulo) {
-        try { interaction._slashLastTitle = titulo || interaction._slashLastTitle; } catch {}
+        try {
+          interaction._slashLastTitle = titulo || interaction._slashLastTitle;
+        } catch {}
       }
       if (deferred || interaction.deferred || interaction.replied) {
         return interaction.followUp(payload).catch(() => null);
       }
-      return interaction.reply({ ...payload, ephemeral: true }).catch(() => null);
+      return interaction
+        .reply({ ...payload, ephemeral: true })
+        .catch(() => null);
     },
   };
 }
@@ -167,7 +174,10 @@ async function handleSlashPlay(interaction, searchEngine = "ytsearch") {
   const query = interaction.options.getString("musica");
   const member = interaction.member;
   if (!member?.voice?.channel) {
-    return interaction.reply({ content: "Entra num canal de voz primeiro!", ephemeral: true });
+    return interaction.reply({
+      content: "Entra num canal de voz primeiro!",
+      ephemeral: true,
+    });
   }
   // Extração leva ~8s: defer público (visível) para não estourar os 3s do Discord.
   await interaction.deferReply();
@@ -177,31 +187,45 @@ async function handleSlashPlay(interaction, searchEngine = "ytsearch") {
     // play() responde via message.reply (= followUp, msg separada). O defer
     // original precisa ser encerrado — edita para confirmação curta.
     const atual = message._slashLastTitle || query;
-    await interaction.editReply(`▶️ **${atual}** — painel acima ⬆️`).catch(() => {});
+    await interaction
+      .editReply(`▶️ **${atual}** — painel acima ⬆️`)
+      .catch(() => {});
   } catch (err) {
-    await interaction.editReply(err.message || "Deu erro ao buscar a música.").catch(() => {});
+    await interaction
+      .editReply(err.message || "Deu erro ao buscar a música.")
+      .catch(() => {});
   }
 }
 
 async function handleSlashPlayNow(interaction) {
   const query = interaction.options.getString("musica");
   if (!interaction.member?.voice?.channel) {
-    return interaction.reply({ content: "Entra num canal de voz primeiro!", ephemeral: true });
+    return interaction.reply({
+      content: "Entra num canal de voz primeiro!",
+      ephemeral: true,
+    });
   }
   await interaction.deferReply({ ephemeral: true });
   const message = fakeMessageFromInteraction(interaction, { deferred: true });
   try {
     await playNow(message, query);
-    await interaction.editReply("⚡ Fura-fila processado — veja o painel.").catch(() => {});
+    await interaction
+      .editReply("⚡ Fura-fila processado — veja o painel.")
+      .catch(() => {});
   } catch (err) {
-    await interaction.editReply(err.message || "Deu erro ao processar o fura-fila.").catch(() => {});
+    await interaction
+      .editReply(err.message || "Deu erro ao processar o fura-fila.")
+      .catch(() => {});
   }
 }
 
 async function handleSlashQueue(interaction) {
   const state = states.get(interaction.guild.id);
   if (!state) {
-    return interaction.reply({ content: "❌ Nenhuma música tocando ou na fila neste servidor.", ephemeral: true });
+    return interaction.reply({
+      content: "❌ Nenhuma música tocando ou na fila neste servidor.",
+      ephemeral: true,
+    });
   }
   const painelFila = criarPainelFila(state, 0);
   return interaction.reply({ ...painelFila, ephemeral: true });
@@ -214,17 +238,25 @@ async function handleSlashHistory(interaction) {
     await interaction.editReply(painelHistorico);
   } catch (error) {
     console.error("Erro ao carregar histórico:", error);
-    await interaction.editReply("❌ Não foi possível carregar o histórico de músicas.");
+    await interaction.editReply(
+      "❌ Não foi possível carregar o histórico de músicas.",
+    );
   }
 }
 
 async function handleSlashNp(interaction) {
   const state = states.get(interaction.guild.id);
   if (!state || !state.current) {
-    return interaction.reply({ content: "❌ Nenhuma música tocando no momento.", ephemeral: true });
+    return interaction.reply({
+      content: "❌ Nenhuma música tocando no momento.",
+      ephemeral: true,
+    });
   }
   const elapsedSec = Math.floor(calcularElapsedMs(state) / 1000);
-  const painel = criarPainelMusical(state.current, elapsedSec, { autoplay: !!state.autoplay, loop: !!state.loop });
+  const painel = criarPainelMusical(state.current, elapsedSec, {
+    autoplay: !!state.autoplay,
+    loop: !!state.loop,
+  });
   return interaction.reply({ ...painel, ephemeral: false });
 }
 
@@ -232,7 +264,11 @@ async function handleSlashSeek(interaction) {
   const raw = interaction.options.getString("tempo");
   const seekSec = parseSeekInput(raw);
   if (seekSec === null || seekSec < 0) {
-    return interaction.reply({ content: "❌ Tempo inválido. Use formatos como `10:20`, `1:12:14`, `00:15` ou `15`.", ephemeral: true });
+    return interaction.reply({
+      content:
+        "❌ Tempo inválido. Use formatos como `10:20`, `1:12:14`, `00:15` ou `15`.",
+      ephemeral: true,
+    });
   }
   await interaction.deferReply({ ephemeral: true });
   const message = fakeMessageFromInteraction(interaction, { deferred: true });
@@ -241,7 +277,9 @@ async function handleSlashSeek(interaction) {
     // seek() já respondeu via followUp; encerra o "pensando".
     await interaction.deleteReply().catch(() => {});
   } catch (err) {
-    await interaction.editReply(err.message || "Deu erro no seek.").catch(() => {});
+    await interaction
+      .editReply(err.message || "Deu erro no seek.")
+      .catch(() => {});
   }
 }
 
@@ -250,44 +288,64 @@ async function handleSlashPlaylists(interaction) {
   if (sub === "minhas") {
     const playlists = await listarTodasPlaylists(interaction.user.id);
     if (!playlists || playlists.length === 0) {
-      return interaction.reply({ content: '📭 Você ainda não tem nenhuma playlist. Use `/playlist criar` para começar!', ephemeral: true });
+      return interaction.reply({
+        content:
+          "📭 Você ainda não tem nenhuma playlist. Use `/playlist criar` para começar!",
+        ephemeral: true,
+      });
     }
     const lista = playlists
-      .map(p => p.name.toLowerCase() === "curtidas"
-        ? `❤️ **${p.name}** (${p.total_musicas} músicas)`
-        : `📁 **${p.name}** (${p.total_musicas} músicas)`)
+      .map((p) =>
+        p.name.toLowerCase() === "curtidas"
+          ? `❤️ **${p.name}** (${p.total_musicas} músicas)`
+          : `📁 **${p.name}** (${p.total_musicas} músicas)`,
+      )
       .join("\n");
-    return interaction.reply({ content: `📋 **Suas playlists:**\n\n${lista}\n\n*Para tocar: \`/playlist tocar\`*`, ephemeral: true });
+    return interaction.reply({
+      content: `📋 **Suas playlists:**\n\n${lista}\n\n*Para tocar: \`/playlist tocar\`*`,
+      ephemeral: true,
+    });
   }
   if (sub === "servidor") {
     await interaction.deferReply({ ephemeral: true });
     const grupos = await listarPlaylistsDoServidor();
     if (!grupos || grupos.length === 0) {
-      return interaction.editReply("📭 Nenhuma playlist criada no servidor ainda.");
+      return interaction.editReply(
+        "📭 Nenhuma playlist criada no servidor ainda.",
+      );
     }
     const linhas = [];
     for (const { user_id, playlists } of grupos) {
       const membro = interaction.guild.members.cache.get(user_id);
       const nome = membro ? membro.displayName : `<@${user_id}>`;
       const itens = playlists
-        .map(p => p.name.toLowerCase() === "curtidas"
-          ? `❤️ ${p.name} (${p.total_musicas})`
-          : `📁 ${p.name} (${p.total_musicas})`)
+        .map((p) =>
+          p.name.toLowerCase() === "curtidas"
+            ? `❤️ ${p.name} (${p.total_musicas})`
+            : `📁 ${p.name} (${p.total_musicas})`,
+        )
         .join("  ·  ");
       linhas.push(`**${nome}** — ${itens}`);
     }
-    return interaction.editReply(`📋 **Playlists do servidor:**\n\n${linhas.join("\n")}`);
+    return interaction.editReply(
+      `📋 **Playlists do servidor:**\n\n${linhas.join("\n")}`,
+    );
   }
   if (sub === "de") {
     const alvo = interaction.options.getUser("usuario");
     const playlists = await listarTodasPlaylists(alvo.id);
     if (!playlists || playlists.length === 0) {
-      return interaction.reply({ content: `📭 **${alvo.displayName ?? alvo.username}** ainda não tem nenhuma playlist criada.`, ephemeral: true });
+      return interaction.reply({
+        content: `📭 **${alvo.displayName ?? alvo.username}** ainda não tem nenhuma playlist criada.`,
+        ephemeral: true,
+      });
     }
     const lista = playlists
-      .map(p => p.name.toLowerCase() === "curtidas"
-        ? `❤️ **${p.name}** (${p.total_musicas} músicas)`
-        : `📁 **${p.name}** (${p.total_musicas} músicas)`)
+      .map((p) =>
+        p.name.toLowerCase() === "curtidas"
+          ? `❤️ **${p.name}** (${p.total_musicas} músicas)`
+          : `📁 **${p.name}** (${p.total_musicas} músicas)`,
+      )
       .join("\n");
     return interaction.reply({
       content: `📋 **Playlists de ${alvo.displayName ?? alvo.username}:**\n\n${lista}\n\n*Para tocar: \`/playlist tocar nome:"Nome" usuario:@${alvo.username}\`*`,
@@ -305,31 +363,58 @@ async function handleSlashPlaylist(interaction) {
       const name = interaction.options.getString("nome");
       const res = await criarPlaylist(userId, name);
       if (res.status === "existe")
-        return interaction.reply({ content: `ℹ️ Você já tem uma playlist chamada **${name}**.`, ephemeral: true });
-      return interaction.reply({ content: `✅ Playlist **${name}** criada com sucesso!`, ephemeral: true });
+        return interaction.reply({
+          content: `ℹ️ Você já tem uma playlist chamada **${name}**.`,
+          ephemeral: true,
+        });
+      return interaction.reply({
+        content: `✅ Playlist **${name}** criada com sucesso!`,
+        ephemeral: true,
+      });
     }
 
     case "excluir": {
       const name = interaction.options.getString("nome");
       if (name.toLowerCase() === "curtidas")
-        return interaction.reply({ content: "⚠️ A playlist de **Curtidas** é protegida pelo sistema.", ephemeral: true });
+        return interaction.reply({
+          content: "⚠️ A playlist de **Curtidas** é protegida pelo sistema.",
+          ephemeral: true,
+        });
       const deletado = await excluirPlaylist(userId, name);
       if (!deletado)
-        return interaction.reply({ content: "❌ Você não possui nenhuma playlist com esse nome.", ephemeral: true });
-      return interaction.reply({ content: `🗑️ Playlist **${name}** excluída com sucesso.`, ephemeral: true });
+        return interaction.reply({
+          content: "❌ Você não possui nenhuma playlist com esse nome.",
+          ephemeral: true,
+        });
+      return interaction.reply({
+        content: `🗑️ Playlist **${name}** excluída com sucesso.`,
+        ephemeral: true,
+      });
     }
 
     case "renomear": {
       const oldName = interaction.options.getString("antigo");
       const newName = interaction.options.getString("novo");
       if (oldName.toLowerCase() === "curtidas")
-        return interaction.reply({ content: "⚠️ A playlist de **Curtidas** não pode ser renomeada.", ephemeral: true });
+        return interaction.reply({
+          content: "⚠️ A playlist de **Curtidas** não pode ser renomeada.",
+          ephemeral: true,
+        });
       const res = await renomearPlaylist(userId, oldName, newName);
       if (res.status === "duplicado")
-        return interaction.reply({ content: `❌ Você já tem outra playlist chamada **${newName}**.`, ephemeral: true });
+        return interaction.reply({
+          content: `❌ Você já tem outra playlist chamada **${newName}**.`,
+          ephemeral: true,
+        });
       if (res.status === "nao_encontrada")
-        return interaction.reply({ content: `❌ Playlist **${oldName}** não encontrada.`, ephemeral: true });
-      return interaction.reply({ content: `🔄 Playlist renomeada de **${oldName}** para **${newName}**!`, ephemeral: true });
+        return interaction.reply({
+          content: `❌ Playlist **${oldName}** não encontrada.`,
+          ephemeral: true,
+        });
+      return interaction.reply({
+        content: `🔄 Playlist renomeada de **${oldName}** para **${newName}**!`,
+        ephemeral: true,
+      });
     }
 
     case "add": {
@@ -339,12 +424,20 @@ async function handleSlashPlaylist(interaction) {
       try {
         const res = await adicionarFaixaPlaylist(userId, playlistName, query);
         if (res.status === "playlist_nao_encontrada")
-          return interaction.editReply(`❌ Você não tem uma playlist chamada **${playlistName}**.`);
+          return interaction.editReply(
+            `❌ Você não tem uma playlist chamada **${playlistName}**.`,
+          );
         if (res.status === "ja_existe")
-          return interaction.editReply(`ℹ️ **${res.title}** já está nessa playlist.`);
-        return interaction.editReply(`🎵 **${res.title}** adicionada à playlist **${playlistName}** na posição **#${res.pos}**!`);
+          return interaction.editReply(
+            `ℹ️ **${res.title}** já está nessa playlist.`,
+          );
+        return interaction.editReply(
+          `🎵 **${res.title}** adicionada à playlist **${playlistName}** na posição **#${res.pos}**!`,
+        );
       } catch (err) {
-        return interaction.editReply("❌ Erro ao buscar ou salvar a música no banco de dados.");
+        return interaction.editReply(
+          "❌ Erro ao buscar ou salvar a música no banco de dados.",
+        );
       }
     }
 
@@ -353,24 +446,50 @@ async function handleSlashPlaylist(interaction) {
       const posicao = interaction.options.getInteger("posicao");
       const res = await removerFaixaPlaylist(userId, playlistName, posicao);
       if (res.status === "playlist_nao_encontrada")
-        return interaction.reply({ content: `❌ Playlist **${playlistName}** não encontrada.`, ephemeral: true });
+        return interaction.reply({
+          content: `❌ Playlist **${playlistName}** não encontrada.`,
+          ephemeral: true,
+        });
       if (res.status === "posicao_invalida")
-        return interaction.reply({ content: "❌ Nenhuma música encontrada nessa posição da playlist.", ephemeral: true });
-      return interaction.reply({ content: `🗑️ **${res.title}** removida com sucesso da playlist!`, ephemeral: true });
+        return interaction.reply({
+          content: "❌ Nenhuma música encontrada nessa posição da playlist.",
+          ephemeral: true,
+        });
+      return interaction.reply({
+        content: `🗑️ **${res.title}** removida com sucesso da playlist!`,
+        ephemeral: true,
+      });
     }
 
     case "mover": {
       const playlistName = interaction.options.getString("playlist");
       const dePos = interaction.options.getInteger("de");
       const paraPos = interaction.options.getInteger("para");
-      const res = await moverFaixaPlaylist(userId, playlistName, dePos, paraPos);
+      const res = await moverFaixaPlaylist(
+        userId,
+        playlistName,
+        dePos,
+        paraPos,
+      );
       if (res.status === "playlist_nao_encontrada")
-        return interaction.reply({ content: `❌ Playlist **${playlistName}** não encontrada.`, ephemeral: true });
+        return interaction.reply({
+          content: `❌ Playlist **${playlistName}** não encontrada.`,
+          ephemeral: true,
+        });
       if (res.status === "fora_dos_limites")
-        return interaction.reply({ content: `❌ Posição inválida. A playlist tem **${res.total}** músicas.`, ephemeral: true });
+        return interaction.reply({
+          content: `❌ Posição inválida. A playlist tem **${res.total}** músicas.`,
+          ephemeral: true,
+        });
       if (res.status === "mesma_posicao")
-        return interaction.reply({ content: "ℹ️ A música já está nessa posição!", ephemeral: true });
-      return interaction.reply({ content: `🔀 Música movida da posição **#${dePos}** para a posição **#${paraPos}** com sucesso!`, ephemeral: true });
+        return interaction.reply({
+          content: "ℹ️ A música já está nessa posição!",
+          ephemeral: true,
+        });
+      return interaction.reply({
+        content: `🔀 Música movida da posição **#${dePos}** para a posição **#${paraPos}** com sucesso!`,
+        ephemeral: true,
+      });
     }
 
     case "listar": {
@@ -378,40 +497,76 @@ async function handleSlashPlaylist(interaction) {
       if (!playlistName) {
         const playlists = await listarTodasPlaylists(userId);
         if (!playlists || playlists.length === 0)
-          return interaction.reply({ content: "📭 Você ainda não tem nenhuma playlist criada.", ephemeral: true });
+          return interaction.reply({
+            content: "📭 Você ainda não tem nenhuma playlist criada.",
+            ephemeral: true,
+          });
         const listaDePlaylists = playlists
-          .map((p) => p.name.toLowerCase() === "curtidas"
-            ? `✨ **${p.name}** (${p.total_musicas} músicas)`
-            : `📁 **${p.name}** (${p.total_musicas} músicas)`)
+          .map((p) =>
+            p.name.toLowerCase() === "curtidas"
+              ? `✨ **${p.name}** (${p.total_musicas} músicas)`
+              : `📁 **${p.name}** (${p.total_musicas} músicas)`,
+          )
           .join("\n");
-        return interaction.reply({ content: `📋 **Suas Playlists:**\n\n${listaDePlaylists}`, ephemeral: true });
+        return interaction.reply({
+          content: `📋 **Suas Playlists:**\n\n${listaDePlaylists}`,
+          ephemeral: true,
+        });
       }
       const faixas = await listarPlaylist(userId, playlistName);
       if (!faixas)
-        return interaction.reply({ content: `❌ Você não tem uma playlist chamada **${playlistName}**.`, ephemeral: true });
+        return interaction.reply({
+          content: `❌ Você não tem uma playlist chamada **${playlistName}**.`,
+          ephemeral: true,
+        });
       if (faixas.length === 0)
-        return interaction.reply({ content: `📭 A playlist **${playlistName}** está vazia.`, ephemeral: true });
-      const listaTexto = faixas.slice(0, 20).map((f) => `**${f.position}.** ${f.title}`).join("\n");
-      const rodape = faixas.length > 20 ? `\n*...e mais ${faixas.length - 20} músicas.*` : "";
-      return interaction.reply({ content: `📑 **Playlist: ${playlistName}**\n\n${listaTexto}${rodape}`, ephemeral: true });
+        return interaction.reply({
+          content: `📭 A playlist **${playlistName}** está vazia.`,
+          ephemeral: true,
+        });
+      const listaTexto = faixas
+        .slice(0, 20)
+        .map((f) => `**${f.position}.** ${f.title}`)
+        .join("\n");
+      const rodape =
+        faixas.length > 20
+          ? `\n*...e mais ${faixas.length - 20} músicas.*`
+          : "";
+      return interaction.reply({
+        content: `📑 **Playlist: ${playlistName}**\n\n${listaTexto}${rodape}`,
+        ephemeral: true,
+      });
     }
 
     case "tocar": {
       const playlistName = interaction.options.getString("nome");
       const outro = interaction.options.getUser("usuario");
-      const donoId = outro && outro.id !== interaction.user.id ? outro.id : userId;
+      const donoId =
+        outro && outro.id !== interaction.user.id ? outro.id : userId;
       if (!interaction.member?.voice?.channelId) {
-        return interaction.reply({ content: "❌ Você precisa estar em um canal de voz para tocar!", ephemeral: true });
+        return interaction.reply({
+          content: "❌ Você precisa estar em um canal de voz para tocar!",
+          ephemeral: true,
+        });
       }
       await interaction.deferReply();
-      const message = fakeMessageFromInteraction(interaction, { deferred: true });
+      const message = fakeMessageFromInteraction(interaction, {
+        deferred: true,
+      });
       const sucesso = await tocarPlaylist(message, donoId, playlistName);
       if (!sucesso)
-        return interaction.editReply(outro && outro.id !== interaction.user.id
-          ? `❌ **${outro.displayName ?? outro.username}** não tem uma playlist chamada **${playlistName}** (ou está vazia).`
-          : `❌ Playlist **${playlistName}** não encontrada ou vazia.`);
-      const rotulo = outro && outro.id !== interaction.user.id ? `de **${outro.displayName ?? outro.username}**` : `**${playlistName}**`;
-      return interaction.editReply(`▶️ Playlist ${rotulo} adicionada à fila com sucesso!`);
+        return interaction.editReply(
+          outro && outro.id !== interaction.user.id
+            ? `❌ **${outro.displayName ?? outro.username}** não tem uma playlist chamada **${playlistName}** (ou está vazia).`
+            : `❌ Playlist **${playlistName}** não encontrada ou vazia.`,
+        );
+      const rotulo =
+        outro && outro.id !== interaction.user.id
+          ? `de **${outro.displayName ?? outro.username}**`
+          : `**${playlistName}**`;
+      return interaction.editReply(
+        `▶️ Playlist ${rotulo} adicionada à fila com sucesso!`,
+      );
     }
   }
 }
@@ -424,64 +579,105 @@ async function handleSlashCommand(interaction) {
   const state = states.get(guildId);
 
   switch (interaction.commandName) {
-    case "play": return handleSlashPlay(interaction, "ytsearch");
-    case "playsc": return handleSlashPlay(interaction, "scsearch");
-    case "playnow": return handleSlashPlayNow(interaction);
-    case "queue": return handleSlashQueue(interaction);
-    case "history": return handleSlashHistory(interaction);
-    case "np": return handleSlashNp(interaction);
-    case "seek": return handleSlashSeek(interaction);
-    case "playlists": return handleSlashPlaylists(interaction);
-    case "playlist": return handleSlashPlaylist(interaction);
+    case "play":
+      return handleSlashPlay(interaction, "ytsearch");
+    case "playsc":
+      return handleSlashPlay(interaction, "scsearch");
+    case "playnow":
+      return handleSlashPlayNow(interaction);
+    case "queue":
+      return handleSlashQueue(interaction);
+    case "history":
+      return handleSlashHistory(interaction);
+    case "np":
+      return handleSlashNp(interaction);
+    case "seek":
+      return handleSlashSeek(interaction);
+    case "playlists":
+      return handleSlashPlaylists(interaction);
+    case "playlist":
+      return handleSlashPlaylist(interaction);
 
     case "stop": {
-      if (!state) return interaction.reply({ content: "❌ Nenhuma atividade musical neste servidor.", ephemeral: true });
+      if (!state)
+        return interaction.reply({
+          content: "❌ Nenhuma atividade musical neste servidor.",
+          ephemeral: true,
+        });
       stop(guildId);
       return interaction.reply("⏹️ Fila esvaziada, adeus.");
     }
     case "skip": {
       const pulou = skip(guildId);
       return interaction.reply({
-        content: pulou ? "⏭️ Música pulada com sucesso!" : "❌ Não tem nenhuma música tocando para eu pular.",
+        content: pulou
+          ? "⏭️ Música pulada com sucesso!"
+          : "❌ Não tem nenhuma música tocando para eu pular.",
         ephemeral: true,
       });
     }
     case "restart": {
       const reiniciou = restart(guildId);
       return interaction.reply({
-        content: reiniciou ? "🔄 Reiniciando a música atual do começo!" : "❌ Não tem nenhuma música tocando para eu reiniciar.",
+        content: reiniciou
+          ? "🔄 Reiniciando a música atual do começo!"
+          : "❌ Não tem nenhuma música tocando para eu reiniciar.",
         ephemeral: true,
       });
     }
     case "pause": {
       const r = pause(guildId);
       return interaction.reply({
-        content: r === "pausado" ? "⏸️ Música pausada." : r === "ja_pausado" ? "⏸️ Já estava pausada." : "❌ Não tem nenhuma música tocando para pausar.",
+        content:
+          r === "pausado"
+            ? "⏸️ Música pausada."
+            : r === "ja_pausado"
+              ? "⏸️ Já estava pausada."
+              : "❌ Não tem nenhuma música tocando para pausar.",
         ephemeral: true,
       });
     }
     case "resume": {
       const r = resume(guildId);
       return interaction.reply({
-        content: r === "retomado" ? "▶️ Música retomada." : r === "nao_pausado" ? "▶️ A música já está tocando." : "❌ Não tem nenhuma música tocando para retomar.",
+        content:
+          r === "retomado"
+            ? "▶️ Música retomada."
+            : r === "nao_pausado"
+              ? "▶️ A música já está tocando."
+              : "❌ Não tem nenhuma música tocando para retomar.",
         ephemeral: true,
       });
     }
     case "autoplay": {
       const ativado = toggleAutoplay(guildId);
-      if (ativado === null) return interaction.reply({ content: "❌ Não há nenhuma sessão de música ativa neste servidor.", ephemeral: true });
-      return interaction.reply(ativado ? "📻 Autoplay **ativado**." : "📻 Autoplay **desativado**.");
+      if (ativado === null)
+        return interaction.reply({
+          content: "❌ Não há nenhuma sessão de música ativa neste servidor.",
+          ephemeral: true,
+        });
+      return interaction.reply(
+        ativado ? "📻 Autoplay **ativado**." : "📻 Autoplay **desativado**.",
+      );
     }
     case "loop": {
       const ativado = toggleLoop(guildId);
-      if (ativado === null) return interaction.reply({ content: "❌ Não há nenhuma sessão de música ativa neste servidor.", ephemeral: true });
-      return interaction.reply(ativado ? "🔂 Loop **ativado**." : "🔂 Loop **desativado**.");
+      if (ativado === null)
+        return interaction.reply({
+          content: "❌ Não há nenhuma sessão de música ativa neste servidor.",
+          ephemeral: true,
+        });
+      return interaction.reply(
+        ativado ? "🔂 Loop **ativado**." : "🔂 Loop **desativado**.",
+      );
     }
     case "remove": {
       const posicao = interaction.options.getInteger("posicao");
       const titulo = removeFromQueue(guildId, posicao);
       return interaction.reply({
-        content: titulo ? `🗑️ **${titulo}** (posição #${posicao}) removida da fila.` : "❌ Posição inválida. Veja os números com `/queue`.",
+        content: titulo
+          ? `🗑️ **${titulo}** (posição #${posicao}) removida da fila.`
+          : "❌ Posição inválida. Veja os números com `/queue`.",
         ephemeral: true,
       });
     }
@@ -489,15 +685,32 @@ async function handleSlashCommand(interaction) {
       const de = interaction.options.getInteger("de");
       const para = interaction.options.getInteger("para");
       const res = moverNaFila(guildId, de, para);
-      if (res.error === "fila_vazia") return interaction.reply({ content: "❌ Não há músicas na fila para mover.", ephemeral: true });
-      if (res.error === "fora_dos_limites") return interaction.reply({ content: `❌ Posição inválida. A fila tem **${res.total}** música(s) após a atual.`, ephemeral: true });
-      if (res.error === "mesma_posicao") return interaction.reply({ content: "ℹ️ A música já está nessa posição!", ephemeral: true });
-      return interaction.reply({ content: `🔀 **${res.title}** movida da posição **#${de}** para **#${para}**!`, ephemeral: true });
+      if (res.error === "fila_vazia")
+        return interaction.reply({
+          content: "❌ Não há músicas na fila para mover.",
+          ephemeral: true,
+        });
+      if (res.error === "fora_dos_limites")
+        return interaction.reply({
+          content: `❌ Posição inválida. A fila tem **${res.total}** música(s) após a atual.`,
+          ephemeral: true,
+        });
+      if (res.error === "mesma_posicao")
+        return interaction.reply({
+          content: "ℹ️ A música já está nessa posição!",
+          ephemeral: true,
+        });
+      return interaction.reply({
+        content: `🔀 **${res.title}** movida da posição **#${de}** para **#${para}**!`,
+        ephemeral: true,
+      });
     }
     case "shuffle": {
       const ok = shuffleQueue(guildId);
       return interaction.reply({
-        content: ok ? "🔀 **Fila embaralhada com sucesso!**" : "❌ Não há músicas suficientes na fila para embaralhar.",
+        content: ok
+          ? "🔀 **Fila embaralhada com sucesso!**"
+          : "❌ Não há músicas suficientes na fila para embaralhar.",
         ephemeral: true,
       });
     }
@@ -540,9 +753,11 @@ client.on("messageCreate", async (message) => {
       const membro = message.guild.members.cache.get(user_id);
       const nome = membro ? membro.displayName : `<@${user_id}>`;
       const itens = playlists
-        .map(p => p.name.toLowerCase() === "curtidas"
-          ? `❤️ ${p.name} (${p.total_musicas})`
-          : `📁 ${p.name} (${p.total_musicas})`)
+        .map((p) =>
+          p.name.toLowerCase() === "curtidas"
+            ? `❤️ ${p.name} (${p.total_musicas})`
+            : `📁 ${p.name} (${p.total_musicas})`,
+        )
         .join("  ·  ");
       linhas.push(`**${nome}** — ${itens}`);
     }
@@ -550,7 +765,8 @@ client.on("messageCreate", async (message) => {
     // Discord limita embeds a 4096 chars; manda em blocos se necessário
     const cabecalho = "📋 **Playlists do servidor:**\n\n";
     const corpo = linhas.join("\n");
-    const rodape = "\n\n*Use `!playlists @usuario` para ver detalhes · `!playlist tocar @usuario \"Nome\"` para tocar*";
+    const rodape =
+      '\n\n*Use `!playlists @usuario` para ver detalhes · `!playlist tocar @usuario "Nome"` para tocar*';
 
     const mensagem = cabecalho + corpo + rodape;
     if (mensagem.length <= 2000) {
@@ -578,29 +794,39 @@ client.on("messageCreate", async (message) => {
     if (!mencionado || mencionado.id === message.author.id) {
       const playlists = await listarTodasPlaylists(message.author.id);
       if (!playlists || playlists.length === 0) {
-        return message.reply('📭 Você ainda não tem nenhuma playlist. Use `!playlist criar "Nome"` para começar!');
+        return message.reply(
+          '📭 Você ainda não tem nenhuma playlist. Use `!playlist criar "Nome"` para começar!',
+        );
       }
       const lista = playlists
-        .map(p => p.name.toLowerCase() === "curtidas"
-          ? `❤️ **${p.name}** (${p.total_musicas} músicas)`
-          : `📁 **${p.name}** (${p.total_musicas} músicas)`)
+        .map((p) =>
+          p.name.toLowerCase() === "curtidas"
+            ? `❤️ **${p.name}** (${p.total_musicas} músicas)`
+            : `📁 **${p.name}** (${p.total_musicas} músicas)`,
+        )
         .join("\n");
-      return message.reply(`📋 **Suas playlists:**\n\n${lista}\n\n*Para tocar: \`!playlist tocar "Nome"\`*`);
+      return message.reply(
+        `📋 **Suas playlists:**\n\n${lista}\n\n*Para tocar: \`!playlist tocar "Nome"\`*`,
+      );
     }
 
     // Listando playlists de outra pessoa
     const playlists = await listarTodasPlaylists(mencionado.id);
     if (!playlists || playlists.length === 0) {
-      return message.reply(`📭 **${mencionado.displayName}** ainda não tem nenhuma playlist criada.`);
+      return message.reply(
+        `📭 **${mencionado.displayName}** ainda não tem nenhuma playlist criada.`,
+      );
     }
     const lista = playlists
-      .map(p => p.name.toLowerCase() === "curtidas"
-        ? `❤️ **${p.name}** (${p.total_musicas} músicas)`
-        : `📁 **${p.name}** (${p.total_musicas} músicas)`)
+      .map((p) =>
+        p.name.toLowerCase() === "curtidas"
+          ? `❤️ **${p.name}** (${p.total_musicas} músicas)`
+          : `📁 **${p.name}** (${p.total_musicas} músicas)`,
+      )
       .join("\n");
     return message.reply(
       `📋 **Playlists de ${mencionado.displayName}:**\n\n${lista}\n\n` +
-      `*Para tocar: \`!playlist tocar @${mencionado.username} "Nome"\`*`
+        `*Para tocar: \`!playlist tocar @${mencionado.username} "Nome"\`*`,
     );
   }
 
@@ -828,9 +1054,9 @@ client.on("messageCreate", async (message) => {
 
         if (!playlistName)
           return message.reply(
-            '❌ Digite o nome da playlist.\n' +
-            'Sua playlist: `!playlist tocar "Nome"`\n' +
-            'De outro membro: `!playlist tocar @usuario "Nome"`',
+            "❌ Digite o nome da playlist.\n" +
+              'Sua playlist: `!playlist tocar "Nome"`\n' +
+              'De outro membro: `!playlist tocar @usuario "Nome"`',
           );
 
         if (!message.member.voice.channelId)
@@ -838,9 +1064,10 @@ client.on("messageCreate", async (message) => {
             "❌ Você precisa estar em um canal de voz para tocar a playlist!",
           );
 
-        const donoLabel = (mencionado && mencionado.id !== message.author.id)
-          ? `de **${mencionado.displayName}**`
-          : `**${playlistName}**`;
+        const donoLabel =
+          mencionado && mencionado.id !== message.author.id
+            ? `de **${mencionado.displayName}**`
+            : `**${playlistName}**`;
 
         const msgAviso = await message.reply(
           `⏳ Carregando as músicas da playlist ${donoLabel} para a fila...`,
@@ -849,7 +1076,7 @@ client.on("messageCreate", async (message) => {
           const sucesso = await tocarPlaylist(message, donoId, playlistName);
           if (!sucesso)
             return msgAviso.edit(
-              (mencionado && mencionado.id !== message.author.id)
+              mencionado && mencionado.id !== message.author.id
                 ? `❌ **${mencionado.displayName}** não tem uma playlist chamada **${playlistName}** (ou está vazia).`
                 : `❌ Playlist **${playlistName}** não encontrada ou vazia.`,
             );
@@ -869,7 +1096,7 @@ client.on("messageCreate", async (message) => {
   if (message.content.startsWith("!playsc")) {
     const query = message.content.replace("!playsc", "").trim();
     if (!query) return message.reply("Nome ou o link da música do SoundCloud!");
-    return play(message, query, 'scsearch');
+    return play(message, query, "scsearch");
   }
 
   if (message.content.startsWith("!play")) {
@@ -915,24 +1142,35 @@ client.on("messageCreate", async (message) => {
   if (message.content.startsWith("!resume")) {
     const resultado = resume(message.guild.id);
     if (resultado === "retomado") message.reply("▶️ Música retomada.");
-    else if (resultado === "nao_pausado") message.reply("▶️ A música já está tocando.");
+    else if (resultado === "nao_pausado")
+      message.reply("▶️ A música já está tocando.");
     else message.reply("❌ Não tem nenhuma música tocando para retomar.");
   }
 
   if (message.content.startsWith("!autoplay")) {
     const ativado = toggleAutoplay(message.guild.id);
-    if (ativado === null) return message.reply("❌ Não há nenhuma sessão de música ativa neste servidor.");
-    message.reply(ativado
-      ? "📻 Autoplay **ativado** — quando a fila acabar, eu continuo com músicas relacionadas (baseado na última do YouTube tocada)."
-      : "📻 Autoplay **desativado**.");
+    if (ativado === null)
+      return message.reply(
+        "❌ Não há nenhuma sessão de música ativa neste servidor.",
+      );
+    message.reply(
+      ativado
+        ? "📻 Autoplay **ativado** — quando a fila acabar, eu continuo com músicas relacionadas (baseado na última do YouTube tocada)."
+        : "📻 Autoplay **desativado**.",
+    );
   }
 
   if (message.content.startsWith("!loop")) {
     const ativado = toggleLoop(message.guild.id);
-    if (ativado === null) return message.reply("❌ Não há nenhuma sessão de música ativa neste servidor.");
-    message.reply(ativado
-      ? "🔂 Loop **ativado** — a música atual vai repetir ao terminar."
-      : "🔂 Loop **desativado**.");
+    if (ativado === null)
+      return message.reply(
+        "❌ Não há nenhuma sessão de música ativa neste servidor.",
+      );
+    message.reply(
+      ativado
+        ? "🔂 Loop **ativado** — a música atual vai repetir ao terminar."
+        : "🔂 Loop **desativado**.",
+    );
   }
 
   if (message.content.startsWith("!move")) {
@@ -940,13 +1178,22 @@ client.on("messageCreate", async (message) => {
     const de = parseInt(args[1]);
     const para = parseInt(args[2]);
     if (isNaN(de) || isNaN(para)) {
-      return message.reply("❌ Use `!move <posição atual> <nova posição>` — veja os números com `!queue`.");
+      return message.reply(
+        "❌ Use `!move <posição atual> <nova posição>` — veja os números com `!queue`.",
+      );
     }
     const res = moverNaFila(message.guild.id, de, para);
-    if (res.error === 'fila_vazia') return message.reply("❌ Não há músicas na fila para mover.");
-    if (res.error === 'fora_dos_limites') return message.reply(`❌ Posição inválida. A fila tem **${res.total}** música(s) após a atual.`);
-    if (res.error === 'mesma_posicao') return message.reply("ℹ️ A música já está nessa posição!");
-    return message.reply(`🔀 **${res.title}** movida da posição **#${de}** para **#${para}**!`);
+    if (res.error === "fila_vazia")
+      return message.reply("❌ Não há músicas na fila para mover.");
+    if (res.error === "fora_dos_limites")
+      return message.reply(
+        `❌ Posição inválida. A fila tem **${res.total}** música(s) após a atual.`,
+      );
+    if (res.error === "mesma_posicao")
+      return message.reply("ℹ️ A música já está nessa posição!");
+    return message.reply(
+      `🔀 **${res.title}** movida da posição **#${de}** para **#${para}**!`,
+    );
   }
 
   if (message.content.startsWith("!np")) {
@@ -956,7 +1203,10 @@ client.on("messageCreate", async (message) => {
     }
 
     const elapsedSec = Math.floor(calcularElapsedMs(state) / 1000);
-    const painel = criarPainelMusical(state.current, elapsedSec, { autoplay: !!state.autoplay, loop: !!state.loop });
+    const painel = criarPainelMusical(state.current, elapsedSec, {
+      autoplay: !!state.autoplay,
+      loop: !!state.loop,
+    });
     message.channel.send(painel);
   }
 
@@ -1009,16 +1259,18 @@ client.on("messageCreate", async (message) => {
     if (!args[1]) {
       return message.reply(
         "❌ Use `!seek <tempo>`. Exemplos:\n" +
-        "`!seek 10:20` → 10 min 20 s\n" +
-        "`!seek 1:12:14` → 1 h 12 min 14 s\n" +
-        "`!seek 15` → 15 min\n" +
-        "`!seek 00:15` → 15 s"
+          "`!seek 10:20` → 10 min 20 s\n" +
+          "`!seek 1:12:14` → 1 h 12 min 14 s\n" +
+          "`!seek 15` → 15 min\n" +
+          "`!seek 00:15` → 15 s",
       );
     }
 
     const seekSec = parseSeekInput(args[1]);
     if (seekSec === null || seekSec < 0) {
-      return message.reply("❌ Tempo inválido. Use formatos como `10:20`, `1:12:14`, `00:15` ou `15`.");
+      return message.reply(
+        "❌ Tempo inválido. Use formatos como `10:20`, `1:12:14`, `00:15` ou `15`.",
+      );
     }
 
     return seek(message.guild.id, seekSec, message);
@@ -1029,7 +1281,9 @@ client.on("messageCreate", async (message) => {
     const posicao = parseInt(args[1]);
 
     if (isNaN(posicao) || posicao < 1) {
-      return message.reply("❌ Use `!remove <número>` — o número da música na fila (veja com `!queue`).");
+      return message.reply(
+        "❌ Use `!remove <número>` — o número da música na fila (veja com `!queue`).",
+      );
     }
 
     const state = states.get(message.guild.id);
@@ -1038,12 +1292,16 @@ client.on("messageCreate", async (message) => {
     }
 
     if (posicao >= state.queue.length) {
-      return message.reply(`❌ Posição inválida. A fila tem **${state.queue.length - 1}** música(s).`);
+      return message.reply(
+        `❌ Posição inválida. A fila tem **${state.queue.length - 1}** música(s).`,
+      );
     }
 
     const titulo = removeFromQueue(message.guild.id, posicao);
     if (titulo) {
-      return message.reply(`🗑️ **${titulo}** (posição #${posicao}) removida da fila.`);
+      return message.reply(
+        `🗑️ **${titulo}** (posição #${posicao}) removida da fila.`,
+      );
     } else {
       return message.reply("❌ Não foi possível remover essa música.");
     }
@@ -1092,7 +1350,7 @@ client.on("messageCreate", async (message) => {
             '`!playlist add "Nome" <música>` — Adiciona faixa\n' +
             '`!playlist remover "Nome" <posição>` — Remove faixa\n' +
             '`!playlist mover "Nome" <de> <para>` — Move faixa\n' +
-            '`!playlist listar` — Lista suas playlists\n' +
+            "`!playlist listar` — Lista suas playlists\n" +
             '`!playlist listar "Nome"` — Lista faixas de uma playlist\n' +
             '`!playlist tocar "Nome"` — Toca uma playlist\n' +
             '`!playlist tocar @usuario "Nome"` — Toca a playlist de outro membro',
@@ -1100,7 +1358,7 @@ client.on("messageCreate", async (message) => {
         {
           name: "👥 Playlists de outros membros",
           value:
-            '`!playlists @usuario` — Lista as playlists de outro membro\n' +
+            "`!playlists @usuario` — Lista as playlists de outro membro\n" +
             '`!playlist tocar @usuario "Nome"` — Toca a playlist de outro membro',
         },
         {
@@ -1108,9 +1366,11 @@ client.on("messageCreate", async (message) => {
           value:
             "`!botmorreu` / `!botbosta` — Reinicia o bot\n" +
             "`!help` / `!comandos` — Mostra esta mensagem",
-        }
+        },
       )
-      .setFooter({ text: "MystMusic • Use os botões do painel para controle rápido" });
+      .setFooter({
+        text: "MystMusic • Use os botões do painel para controle rápido",
+      });
 
     return message.channel.send({ embeds: [embed] });
   }
@@ -1165,7 +1425,10 @@ client.on("interactionCreate", async (interaction) => {
       await handleSlashCommand(interaction);
     } catch (error) {
       console.error("Erro no slash command:", error);
-      const payload = { content: "❌ Ocorreu um erro ao executar o comando.", ephemeral: true };
+      const payload = {
+        content: "❌ Ocorreu um erro ao executar o comando.",
+        ephemeral: true,
+      };
       if (interaction.deferred || interaction.replied) {
         await interaction.followUp(payload).catch(() => {});
       } else {
@@ -1312,13 +1575,17 @@ client.on("interactionCreate", async (interaction) => {
           if (pausado) {
             const r = resume(guildId);
             await interaction.reply({
-              content: r === "retomado" ? "▶️ Retomado!" : "❌ Não foi possível retomar.",
+              content:
+                r === "retomado"
+                  ? "▶️ Retomado!"
+                  : "❌ Não foi possível retomar.",
               ephemeral: true,
             });
           } else {
             const r = pause(guildId);
             await interaction.reply({
-              content: r === "pausado" ? "⏸️ Pausado!" : "❌ Não foi possível pausar.",
+              content:
+                r === "pausado" ? "⏸️ Pausado!" : "❌ Não foi possível pausar.",
               ephemeral: true,
             });
           }
@@ -1433,7 +1700,8 @@ async function desligarBotGraciosamente() {
         // cleanupVoiceState já limpa timers, mata yt-dlp/ffmpeg, para o
         // player, destrói a conexão e remove o state.
         const tinha = cleanupVoiceState(guildId);
-        if (tinha) console.log(`✅ Desconectado com sucesso da guilda: ${guildId}`);
+        if (tinha)
+          console.log(`✅ Desconectado com sucesso da guilda: ${guildId}`);
       } catch (err) {
         console.error(`Erro ao desconectar da guilda ${guildId}:`, err);
       }
@@ -1539,7 +1807,9 @@ function criarPainelHistorico(guildId, pagina = 0) {
               : titulo;
 
             // Autoplay salva requested_by como NULL — evita renderizar <@null>.
-            const quemPediu = row.requested_by ? `<@${row.requested_by}>` : "📻 Autoplay";
+            const quemPediu = row.requested_by
+              ? `<@${row.requested_by}>`
+              : "📻 Autoplay";
             descricao += `\`${posicao}.\` \`[${dataHoraFormatada}]\` **${tituloFormatado}** | ${quemPediu}\n`;
           });
 

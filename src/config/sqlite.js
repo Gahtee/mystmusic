@@ -13,12 +13,12 @@ const playlistDb = new sqlite3.Database(playlistDbPath);
 // Carrega os schemas
 const playLogsSchema = fs.readFileSync(
   path.resolve(__dirname, "../../db/play_logs.sql"),
-  "utf-8"
+  "utf-8",
 );
 
 const playlistSchema = fs.readFileSync(
   path.resolve(__dirname, "../../db/playlist.sql"),
-  "utf-8"
+  "utf-8",
 );
 
 // Executa os schemas nos respectivos bancos
@@ -34,15 +34,18 @@ playlistDb.serialize(() => {
   });
   // Migração: adiciona a coluna "duration" em bancos criados antes dela existir.
   // ALTER TABLE ADD COLUMN dá erro se a coluna já existe — nesse caso é esperado, ignora.
-  playlistDb.run(`ALTER TABLE playlist_tracks ADD COLUMN duration INTEGER`, (err) => {
-    if (err && !/duplicate column name/i.test(err.message)) {
-      console.error("Erro na migração da coluna 'duration':", err.message);
-    }
-  });
+  playlistDb.run(
+    `ALTER TABLE playlist_tracks ADD COLUMN duration INTEGER`,
+    (err) => {
+      if (err && !/duplicate column name/i.test(err.message)) {
+        console.error("Erro na migração da coluna 'duration':", err.message);
+      }
+    },
+  );
 });
 
 // Exporta as duas instâncias para usar no restante do bot
 module.exports = {
   logsDb,
-  playlistDb
+  playlistDb,
 };
