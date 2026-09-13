@@ -14,13 +14,17 @@ const { TOKEN, GUILDS } = require("./config/env");
 const {
   play,
   stop,
+  cleanupVoiceState,
   skip,
   restart,
   pause,
   resume,
   toggleAutoplay,
+  toggleLoop,
+  moverNaFila,
   playNow,
   criarPainelMusical,
+  calcularElapsedMs,
   adicionarAosCurtidos,
   shuffleQueue,
   removeFromQueue,
@@ -72,7 +76,9 @@ function criarPainelFila(state, pagina = 0) {
     embed.setDescription("A fila está completamente vazia.");
     return { embeds: [embed], components: [] };
   }
-  let descricao = `**Tocando Agora:**\n🔹 [${current.title}](${current.url}) | <@${current.requestedBy}>\n\n`;
+  // Autoplay tem requestedBy null — evita renderizar <@null> / <@undefined>.
+  const rotuloPedido = (faixa) => faixa && faixa.requestedBy ? `<@${faixa.requestedBy}>` : "📻 Autoplay";
+  let descricao = `**Tocando Agora:**\n🔹 [${current.title}](${current.url}) | ${rotuloPedido(current)}\n\n`;
 
   if (queue.length > 1) {
     descricao += `**Próximas Músicas:**\n`;
@@ -80,7 +86,7 @@ function criarPainelFila(state, pagina = 0) {
     const fim = Math.min(inicio + itensPorPagina, queue.length);
 
     for (let i = inicio; i < fim; i++) {
-      descricao += `\`${i}.\` [${queue[i].title}](${queue[i].url}) | <@${queue[i].requestedBy}>\n`;
+      descricao += `\`${i}.\` [${queue[i].title}](${queue[i].url}) | ${rotuloPedido(queue[i])}\n`;
     }
 
     embed.setFooter({
@@ -121,9 +127,11 @@ function criarPainelFila(state, pagina = 0) {
 
 client.on("messageCreate", async (message) => {
   if (message.author.bot || !message.guild) return;
-  if (message.content.startsWith("!playnow") || message.content.startsWith("!playnext"))
-    {
-    const query = message.content.replace("!playnow", "").trim();
+  // Aceita !playnow e !playnext (o código antigo só removia "!playnow",
+  // então "!playnext <q>" chegava ao playNow com o prefixo junto).
+  const playNowMatch = message.content.match(/^!play(?:now|next)\s*/);
+  if (playNowMatch) {
+    const query = message.content.slice(playNowMatch[0].length).trim();
     if (!query)
       return message.reply("Nome ou o link da música que vai furar a fila!");
     return playNow(message, query);
@@ -535,13 +543,36 @@ client.on("messageCreate", async (message) => {
       : "📻 Autoplay **desativado**.");
   }
 
+  if (message.content.startsWith("!loop")) {
+    const ativado = toggleLoop(message.guild.id);
+    if (ativado === null) return message.reply("❌ Não há nenhuma sessão de música ativa neste servidor.");
+    message.reply(ativado
+      ? "🔂 Loop **ativado** — a música atual vai repetir ao terminar."
+      : "🔂 Loop **desativado**.");
+  }
+
+  if (message.content.startsWith("!move")) {
+    const args = message.content.split(/\s+/);
+    const de = parseInt(args[1]);
+    const para = parseInt(args[2]);
+    if (isNaN(de) || isNaN(para)) {
+      return message.reply("❌ Use `!move <posição atual> <nova posição>` — veja os números com `!queue`.");
+    }
+    const res = moverNaFila(message.guild.id, de, para);
+    if (res.error === 'fila_vazia') return message.reply("❌ Não há músicas na fila para mover.");
+    if (res.error === 'fora_dos_limites') return message.reply(`❌ Posição inválida. A fila tem **${res.total}** música(s) após a atual.`);
+    if (res.error === 'mesma_posicao') return message.reply("ℹ️ A música já está nessa posição!");
+    return message.reply(`🔀 **${res.title}** movida da posição **#${de}** para **#${para}**!`);
+  }
+
   if (message.content.startsWith("!np")) {
     const state = states.get(message.guild.id);
     if (!state || !state.current) {
       return message.reply("❌ Nenhuma música tocando no momento.");
     }
 
-    const painel = criarPainelMusical(state.current);
+    const elapsedSec = Math.floor(calcularElapsedMs(state) / 1000);
+    const painel = criarPainelMusical(state.current, elapsedSec, { autoplay: !!state.autoplay, loop: !!state.loop });
     message.channel.send(painel);
   }
 
@@ -643,7 +674,7 @@ client.on("messageCreate", async (message) => {
           name: "▶️ Reprodução",
           value:
             "`!play <nome/link>` — Adiciona música à fila (YouTube)\n" +
-            "`!playsc <nome/link>` — Adiciona música à fila (SoundCloud)\n" +
+            "`!playsc <nome/link ou link direto>` — SoundCloud (busca pode retornar preview de 30s em faixa de selo; prefira link direto)\n" +
             "`!playnow <nome/link>` — Fura a fila e toca imediatamente\n" +
             "`!stop` — Para tudo e esvazia a fila\n" +
             "`!skip` — Pula para a próxima música\n" +
@@ -656,6 +687,8 @@ client.on("messageCreate", async (message) => {
           value:
             "`!queue` / `!fila` — Mostra as músicas na fila\n" +
             "`!remove <número>` — Remove uma música da fila pelo número\n" +
+            "`!move <de> <para>` — Move uma música dentro da fila\n" +
+            "`!loop` — Ativa/desativa repetição da música atual\n" +
             "`!seek <tempo>` — Vai para um trecho da música (ex: `10:20`, `1:12:14`, `00:15`, `15`)\n" +
             "`!shuffle` / `!misturar` — Embaralha a fila\n" +
             "`!np` — Mostra o painel da música atual",
@@ -728,18 +761,9 @@ client.on("voiceStateUpdate", async (oldState, newState) => {
       console.log(
         `🤖 Desconectando por inatividade no servidor ${guildId} (Canal vazio).`,
       );
-      const state = states.get(guildId);
-      if (state) {
-        if (state.player) state.player.stop();
-        if (state.connection) {
-          try {
-            state.connection.destroy();
-          } catch (e) {
-            console.error("Erro ao destruir conexão:", e);
-          }
-        }
-        states.delete(guildId);
-      } else {
+      // cleanupVoiceState limpa timers, mata yt-dlp/ffmpeg, destrói a conexão
+      // e remove o state — antes os timers de progresso vazavam aqui.
+      if (!cleanupVoiceState(guildId)) {
         const { getVoiceConnection } = require("@discordjs/voice");
         const connection = getVoiceConnection(guildId);
         if (connection) connection.destroy();
@@ -1075,7 +1099,6 @@ client.on("interactionCreate", async (interaction) => {
       const painelFila = criarPainelFila(state, 0);
       return interaction.reply({ ...painelFila, ephemeral: true });
     }
-
     // Cenário D: Passar/Voltar página na Fila
     if (
       interaction.customId.startsWith("queue_prev_") ||
@@ -1255,16 +1278,12 @@ async function desligarBotGraciosamente() {
   console.log("\n🛑 Desligando o bot... Limpando conexões de voz.");
 
   try {
-    for (const [guildId, state] of states.entries()) {
+    for (const [guildId, state] of [...states.entries()]) {
       try {
-        if (state.player) {
-          state.player.stop();
-        }
-        if (state.connection) {
-          state.connection.removeAllListeners();
-          state.connection.destroy();
-          console.log(`✅ Desconectado com sucesso da guilda: ${guildId}`);
-        }
+        // cleanupVoiceState já limpa timers, mata yt-dlp/ffmpeg, para o
+        // player, destrói a conexão e remove o state.
+        const tinha = cleanupVoiceState(guildId);
+        if (tinha) console.log(`✅ Desconectado com sucesso da guilda: ${guildId}`);
       } catch (err) {
         console.error(`Erro ao desconectar da guilda ${guildId}:`, err);
       }
@@ -1369,7 +1388,9 @@ function criarPainelHistorico(guildId, pagina = 0) {
               ? `[${titulo}](${linkVideo})`
               : titulo;
 
-            descricao += `\`${posicao}.\` \`[${dataHoraFormatada}]\` **${tituloFormatado}** | <@${row.requested_by}>\n`;
+            // Autoplay salva requested_by como NULL — evita renderizar <@null>.
+            const quemPediu = row.requested_by ? `<@${row.requested_by}>` : "📻 Autoplay";
+            descricao += `\`${posicao}.\` \`[${dataHoraFormatada}]\` **${tituloFormatado}** | ${quemPediu}\n`;
           });
 
           embed.setDescription(descricao);

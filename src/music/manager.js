@@ -1,13 +1,21 @@
 const { joinVoiceChannel, createAudioPlayer, entersState, VoiceConnectionStatus, StreamType } = require("@discordjs/voice");
 const { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require("discord.js");
 const { playStream } = require("./player");
-const { getAudioMetadata, getAudioStream, getPlaylistMetadata } = require("./resolver");
+const { getAudioMetadata, getAudioStream, getPlaylistMetadata, killStreamProcesses } = require("./resolver");
 const { logsDb, playlistDb } = require("../config/sqlite");
 const states = new Map();
 
+// Limites anti-spam: evitam N yt-dlp em paralelo e fila infinita.
+const MAX_QUEUE = 100;
+// Intervalo de atualização da barra de progresso (30s p/ evitar rate-limit).
+const PROGRESS_EDIT_INTERVAL_MS = 30_000;
+const PROGRESS_INITIAL_DELAY_MS = 10_000;
+
 function savePlayLog(guildId, userId, query, title, status, errorMessage = null) {
     const sql = `INSERT INTO play_logs (guild_id, requested_by, query, resolved_title, status, error_message) VALUES (?, ?, ?, ?, ?, ?)`;
-    logsDb.run(sql, [guildId, userId, query, title, status, errorMessage]);
+    logsDb.run(sql, [guildId, userId, query, title, status, errorMessage], (err) => {
+        if (err) console.error('Falha ao salvar play_log:', err.message);
+    });
 }
 
 function formatarTempo(segundos) {
@@ -39,20 +47,36 @@ function extrairYoutubeId(url) {
     return match ? match[1] : null;
 }
 
-function criarPainelMusical(metadata, elapsedSec = 0) {
-    const barra = criarBarraProgresso(elapsedSec, metadata.duration);
+function criarPainelMusical(metadata, elapsedSec = 0, flags = {}) {
+    const titulo = metadata.title || '🔍 Buscando dados da faixa...';
+    const url = metadata.url || null;
+    const descricaoTitulo = url ? `**[${titulo}](${url})**` : `**${titulo}**`;
+    // Clamp: o relógio é Date.now() e o Discord atrasa/adianta o áudio real —
+    // sem isso o painel mostra "4:10 / 4:05".
+    const elapsedSafe = Math.max(0, Math.floor(elapsedSec) || 0);
+    const elapsed = metadata.duration ? Math.min(elapsedSafe, Math.floor(metadata.duration)) : elapsedSafe;
+    const barra = metadata.duration
+        ? `${criarBarraProgresso(elapsed, metadata.duration)}\n\`${formatarTempo(elapsed)} / ${formatarTempo(metadata.duration)}\``
+        : '🔍 *Carregando informações...*';
     const pedidoPor = metadata.requestedBy ? `<@${metadata.requestedBy}>` : '📻 Autoplay';
+    const statusExtras = [
+        flags.autoplay ? '📻 Autoplay ON' : null,
+        flags.loop ? '🔂 Loop ON' : null,
+    ].filter(Boolean).join(' • ');
+    const rodape = statusExtras
+        ? `MystMusic • ${statusExtras}`
+        : 'MystMusic • Controle pelos botões abaixo';
 
     const embed = new EmbedBuilder()
         .setColor('#5865F2')
         .setTitle('🎶 Tocando Agora')
-        .setDescription(`**[${metadata.title}](${metadata.url})**\n${barra}\n\`${formatarTempo(elapsedSec)} / ${formatarTempo(metadata.duration)}\``)
+        .setDescription(`${descricaoTitulo}\n${barra}`)
         .setThumbnail(metadata.thumbnail || null)
         .addFields(
-            { name: '📺 Canal', value: metadata.uploader || "Desconhecido", inline: true },
+            { name: '📺 Canal', value: String(metadata.uploader || "Desconhecido").slice(0, 256), inline: true },
             { name: '👤 Pedido por', value: pedidoPor, inline: true }
         )
-        .setFooter({ text: 'MystMusic • Controle pelos botões abaixo' });
+        .setFooter({ text: rodape });
     const row1 = new ActionRowBuilder().addComponents(
         new ButtonBuilder()
             .setCustomId('btn_restart')
@@ -73,12 +97,16 @@ function criarPainelMusical(metadata, elapsedSec = 0) {
         new ButtonBuilder()
             .setCustomId('btn_like')
             .setLabel('❤️ Curtir')
-            .setStyle(ButtonStyle.Danger)
+            .setStyle(ButtonStyle.Secondary)
     );
     const row2 = new ActionRowBuilder().addComponents(
         new ButtonBuilder()
             .setCustomId('btn_pauseresume')
             .setLabel('⏯️ Pausar/Retomar')
+            .setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder()
+            .setCustomId('btn_queue')
+            .setLabel('📋 Fila')
             .setStyle(ButtonStyle.Secondary)
     );
 
@@ -100,17 +128,30 @@ function shuffleQueue(guildId) {
     return true;
 }
 
+// Para os timers da barra de progresso sem derrubar o resto do state.
+function limparTimersProgresso(state) {
+    if (!state) return;
+    if (state.progressTimeout) { clearTimeout(state.progressTimeout); state.progressTimeout = null; }
+    if (state.progressInterval) { clearInterval(state.progressInterval); state.progressInterval = null; }
+}
+
+// Mata o stream anterior (yt-dlp/ffmpeg) antes de trocar de faixa.
+function pararStreamAtual(state) {
+    if (!state || !state.audioStream) return;
+    killStreamProcesses(state.audioStream);
+    state.audioStream = null;
+}
+
+// Flags visuais do painel (autoplay/loop) sem acoplar o state inteiro.
+function flagsDoPainel(state) {
+    if (!state) return {};
+    return { autoplay: !!state.autoplay, loop: !!state.loop };
+}
+
 // Gerenciador de painéis (envia o novo, tenta apagar o antigo, e liga a atualização
 // periódica da barra de progresso)
 async function enviarNovoPainel(channel, state, metadata) {
-    if (state.progressTimeout) {
-        clearTimeout(state.progressTimeout);
-        state.progressTimeout = null;
-    }
-    if (state.progressInterval) {
-        clearInterval(state.progressInterval);
-        state.progressInterval = null;
-    }
+    limparTimersProgresso(state);
     if (state.lastPanelMessage) {
         try {
             await state.lastPanelMessage.delete();
@@ -118,32 +159,39 @@ async function enviarNovoPainel(channel, state, metadata) {
             // Ignora se a mensagem já tiver sido apagada manualmente
         }
     }
-    const painel = criarPainelMusical(metadata, Math.floor(calcularElapsedMs(state) / 1000));
+    const painel = criarPainelMusical(metadata, Math.floor(calcularElapsedMs(state) / 1000), flagsDoPainel(state));
     state.lastPanelMessage = await channel.send(painel);
 
     // Só vale a pena atualizar a barra se soubermos a duração da faixa.
-    // Delay de 10s antes de começar o intervalo, para compensar o tempo entre o
-    // envio da mensagem e o início real da reprodução no Discord.
+    // Delay inicial para compensar o tempo entre o envio da mensagem e o início
+    // real da reprodução no Discord. Intervalo de 30s para evitar rate-limit
+    // da API do Discord em sessões longas.
     if (metadata.duration) {
         state.progressTimeout = setTimeout(() => {
             state.progressInterval = setInterval(async () => {
                 if (!state.current || !state.lastPanelMessage) return;
                 const elapsedSec = Math.floor(calcularElapsedMs(state) / 1000);
+                // Pausado: a barra não anda, não gasta edit à toa.
+                if (state.pausedAt) return;
                 try {
-                    await state.lastPanelMessage.edit(criarPainelMusical(state.current, elapsedSec));
+                    await state.lastPanelMessage.edit(criarPainelMusical(state.current, elapsedSec, flagsDoPainel(state)));
                 } catch (err) {
                     // Mensagem apagada manualmente ou permissão perdida — para de tentar.
                     clearInterval(state.progressInterval);
                     state.progressInterval = null;
                 }
-            }, 15000);
-        }, 10000);
+            }, PROGRESS_EDIT_INTERVAL_MS);
+        }, PROGRESS_INITIAL_DELAY_MS);
     }
 }
 
 // Centraliza a decisão de qual StreamType usar e o retry automático.
 // song.isOpus: true (confirmado), false (confirmado outro codec) ou null/undefined (desconhecido, ex: playlists).
 function iniciarReproducao(state, song, forcarTranscodificacao = false, seekSec = 0) {
+    // Mata o stream anterior antes de criar o novo — sem isso cada skip/seek
+    // deixava um yt-dlp (+ffmpeg) órfão consumindo banda/CPU.
+    pararStreamAtual(state);
+
     // Seek sempre força transcodificação (--download-sections quebra o Opus nativo).
     const streamType = (forcarTranscodificacao || seekSec > 0 || song.isOpus === false)
         ? StreamType.Arbitrary
@@ -156,7 +204,73 @@ function iniciarReproducao(state, song, forcarTranscodificacao = false, seekSec 
     if (!forcarTranscodificacao) state.fallbackAttempted = false;
 
     const audioStream = getAudioStream(song.url, seekSec);
+    state.audioStream = audioStream;
     playStream(state.player, audioStream, streamType);
+}
+
+// Inicia uma faixa otimista: o stream começa IMEDIATAMENTE com o que já se
+// sabe, sem esperar o metadado completo (~8s). Retorna a promise de metadados
+// para o chamador preencher título/painel/log quando chegar.
+// metaPromise opcional: reaproveita uma extração já em andamento (evita duplo yt-dlp).
+function iniciarFaixaOtimista(state, song, query, searchEngine = 'ytsearch', seekSec = 0, metaPromise = null) {
+    // Stream usa URL canônica se já conhecida; senão monta o target de busca
+    // (yt-dlp resolve `ytsearch1:termo` direto como stream — texto cru não vale).
+    const isQueryUrl = typeof query === 'string' && (query.startsWith('http://') || query.startsWith('https://'));
+    const streamTarget = song.url || (isQueryUrl ? query : `${searchEngine}1:${query}`);
+    pararStreamAtual(state);
+
+    // Otimista: ainda não sabemos o codec → começa em WebmOpus (passthrough,
+    // sem transcodificação). Se falhar no início, o handler de 'error' do
+    // player faz fallback para Arbitrary (caminho já existente).
+    const streamType = (seekSec > 0 || song.isOpus === false)
+        ? StreamType.Arbitrary
+        : StreamType.WebmOpus;
+
+    state.playbackStartedAt = Date.now() - (seekSec * 1000);
+    state.pausedAt = null;
+    state.totalPausedMs = 0;
+    state.fallbackAttempted = false;
+
+    const audioStream = getAudioStream(streamTarget, seekSec);
+    state.audioStream = audioStream;
+    playStream(state.player, audioStream, streamType);
+
+    // Metadados em paralelo (cache cobre repetições em ~0ms).
+    // Se o chamador já tem uma extração em andamento, reaproveita.
+    const metaP = metaPromise || (song.url
+        ? garantirMetadadosCompletos(song)
+        : getAudioMetadata(query, searchEngine).then((meta) => {
+            song.title = meta.title;
+            song.url = meta.url;
+            song.uploader = meta.uploader;
+            song.thumbnail = meta.thumbnail;
+            song.isOpus = meta.isOpus;
+            song.duration = meta.duration;
+            return song;
+        }));
+    metaP.catch(() => {});
+    return metaP;
+}
+
+// Pré-resolve os metadados da próxima faixa em background enquanto a atual
+// toca. Na transição, o metadado já está no cache → skip/fim de faixa
+// começam o stream sem esperar extração.
+function prefetchProxima(state, searchEngine = 'ytsearch') {
+    try {
+        const proxima = state && state.queue && state.queue[1];
+        if (!proxima) return;
+        // Só vale pré-resolver se ainda falta algo (playlist flat ou otimista).
+        if (proxima.title && proxima.duration && proxima.url) return;
+        const p = proxima.url
+            ? garantirMetadadosCompletos(proxima)
+            : getAudioMetadata(proxima.query || '', searchEngine).then((meta) => {
+                Object.assign(proxima, meta);
+                return proxima;
+            });
+        p.catch(() => {});
+    } catch (err) {
+        // Pré-fetch é best-effort — nunca pode quebrar a reprodução.
+    }
 }
 
 // Faixas vindas de playlist são listadas com --flat-playlist (rápido), mas o
@@ -164,14 +278,18 @@ function iniciarReproducao(state, song, forcarTranscodificacao = false, seekSec 
 // conhecida do yt-dlp). Se estiver faltando, busca os metadados completos AGORA — só
 // dessa faixa, não da playlist inteira, então não impacta o tempo de adicionar à fila.
 async function garantirMetadadosCompletos(song) {
-    if (song.title && song.duration) return song;
+    if (song.title && song.duration && song.url) return song;
     try {
         const completo = await getAudioMetadata(song.url);
-        song.title = completo.title;
+        song.title = song.title || completo.title;
         song.uploader = completo.uploader;
-        song.thumbnail = completo.thumbnail;
+        song.thumbnail = song.thumbnail || completo.thumbnail;
         song.isOpus = completo.isOpus;
-        song.duration = completo.duration;
+        song.duration = song.duration || completo.duration;
+        // URL pode ter sido resolvida agora (caso do play otimista por busca).
+        if (completo.url && (!song.url || /^ytsearch\d*:/i.test(song.url))) {
+            song.url = completo.url;
+        }
     } catch (err) {
         console.error(`Falha ao completar metadados de ${song.url}:`, err.message);
         song.title = song.title || "Título indisponível";
@@ -243,20 +361,36 @@ async function play(message, query, searchEngine = 'ytsearch') {
                 const currentState = states.get(guildId);
                 if (!currentState) return;
 
+                // Loop de faixa: não avança a fila, retoca a atual do zero.
+                // Equivale a um restart automático (sem duplicar referência).
+                if (currentState.loop && currentState.current) {
+                    iniciarReproducao(currentState, currentState.current);
+                    if (currentState.textChannel) {
+                        await enviarNovoPainel(currentState.textChannel, currentState, currentState.current).catch(() => {});
+                    }
+                    return;
+                }
+
                 currentState.queue.shift();
 
                 if (currentState.queue.length > 0) {
-                    currentState.current = currentState.queue[0]; 
-                    
-                    iniciarReproducao(currentState, currentState.current);
+                    currentState.current = currentState.queue[0];
 
-                    // Garante título/uploader/thumbnail antes de montar o painel (necessário
-                    // pro SoundCloud, cujo modo --flat-playlist não traz esses campos).
-                    await garantirMetadadosCompletos(currentState.current);
+                    // Play imediato: stream começa já, metadados completam em
+                    // paralelo (ou já vieram do pré-fetch) e o painel atualiza.
+                    const metaP = iniciarFaixaOtimista(currentState, currentState.current, currentState.current.query);
+                    enviarNovoPainel(currentState.textChannel, currentState, currentState.current).catch(() => {});
+                    prefetchProxima(currentState);
 
-                    // Envia o painel automático para a próxima música
-                    if (currentState.textChannel) {
-                        await enviarNovoPainel(currentState.textChannel, currentState, currentState.current);
+                    try {
+                        await metaP;
+                    } catch (err) {
+                        console.error('Falha nos metadados da próxima faixa:', err.message);
+                    }
+
+                    // Atualiza o painel com os dados completos (título, thumbnail).
+                    if (currentState.textChannel && currentState.current) {
+                        await enviarNovoPainel(currentState.textChannel, currentState, currentState.current).catch(() => {});
                     }
 
                     const quemPediu = currentState.current.requestedBy || "Fila Automática";
@@ -282,12 +416,16 @@ async function play(message, query, searchEngine = 'ytsearch') {
                         currentState.queue.push(...relacionadas);
                         currentState.current = currentState.queue[0];
 
-                        iniciarReproducao(currentState, currentState.current);
-                        await garantirMetadadosCompletos(currentState.current);
-
+                        const metaP = iniciarFaixaOtimista(currentState, currentState.current, currentState.current.query);
                         if (currentState.textChannel) {
                             currentState.textChannel.send(`📻 **Autoplay:** adicionei ${relacionadas.length} música(s) relacionada(s) à fila.`).catch(() => {});
-                            await enviarNovoPainel(currentState.textChannel, currentState, currentState.current);
+                            await enviarNovoPainel(currentState.textChannel, currentState, currentState.current).catch(() => {});
+                        }
+                        try { await metaP; } catch (err) {
+                            console.error('Autoplay: falha nos metadados:', err.message);
+                        }
+                        if (currentState.textChannel && currentState.current) {
+                            await enviarNovoPainel(currentState.textChannel, currentState, currentState.current).catch(() => {});
                         }
 
                         savePlayLog(guildId, null, currentState.current.query, currentState.current.title, "SUCCESS");
@@ -301,66 +439,134 @@ async function play(message, query, searchEngine = 'ytsearch') {
         });
 
         // Configuração inicial do Estado do Servidor
-        state = { 
-            connection, 
-            player: serverPlayer, 
-            queue: [], 
+        state = {
+            connection,
+            player: serverPlayer,
+            queue: [],
             current: null,
             textChannel: message.channel, // Salva o canal para usar no stateChange
             lastPanelMessage: null,
             autoplay: false,
+            loop: false,
             pausedAt: null,
             totalPausedMs: 0,
             progressInterval: null,
-            progressTimeout: null
+            progressTimeout: null,
+            audioStream: null
         };
         states.set(guildId, state);
+    } else {
+        // Sessão já existe: acompanha o canal de texto mais recente para que o
+        // painel da próxima faixa não caia num canal antigo.
+        state.textChannel = message.channel;
     }
+
+    // Anti-spam: barra novas adições quando a fila já está cheia.
+    const filaCheia = () => state.queue.length >= MAX_QUEUE;
 
     try {
         if (isPlaylist) {
             message.reply("🔍 Processando playlist... Isso pode levar alguns segundos.");
 
             const { playlistTitle, songs } = await metadataPromise;
-            
+
             if (!songs || songs.length === 0) {
                 return message.reply("❌ Não encontrei nenhuma música válida nessa playlist.");
             }
 
-            songs.forEach(song => {
+            const espacoLivre = Math.max(0, MAX_QUEUE - state.queue.length);
+            if (espacoLivre <= 0) {
+                return message.reply(`❌ A fila está cheia (limite de ${MAX_QUEUE}). Use \`!skip\` ou \`!remove\` para liberar espaço.`);
+            }
+            const paraAdicionar = songs.slice(0, espacoLivre);
+
+            paraAdicionar.forEach(song => {
                 song.requestedBy = message.author.id;
                 song.query = song.url;
+                // Campos que o modo --flat-playlist não garante (ex: SoundCloud).
+                song.isOpus = song.isOpus ?? null;
                 state.queue.push(song);
             });
 
-            message.reply(`✅ **${songs.length} músicas** da playlist **"${playlistTitle}"** foram adicionadas à fila!`);
+            const avisoLimite = songs.length > paraAdicionar.length
+                ? ` (limite de ${MAX_QUEUE} — ${songs.length - paraAdicionar.length} ficaram de fora)`
+                : '';
+            message.reply(`✅ **${paraAdicionar.length} músicas** da playlist **"${playlistTitle}"** foram adicionadas à fila!${avisoLimite}`);
 
-            if (state.queue.length === songs.length) {
+            if (state.queue.length === paraAdicionar.length) {
                 state.current = state.queue[0];
-                iniciarReproducao(state, state.current);
-
-                // Garante título/uploader/thumbnail antes de montar o painel (necessário
-                // pro SoundCloud, cujo modo --flat-playlist não traz esses campos).
-                await garantirMetadadosCompletos(state.current);
-
-                await enviarNovoPainel(message.channel, state, state.current);
+                // Play imediato da 1ª faixa da playlist + painel provisório;
+                // metadados completam em paralelo e o painel atualiza.
+                const metaP = iniciarFaixaOtimista(state, state.current, state.current.query);
+                await enviarNovoPainel(message.channel, state, state.current).catch(() => {});
+                prefetchProxima(state);
+                try { await metaP; } catch (err) {
+                    console.error('Falha nos metadados da playlist:', err.message);
+                }
+                await enviarNovoPainel(message.channel, state, state.current).catch(() => {});
                 savePlayLog(guildId, message.author.id, state.current.query, state.current.title, "SUCCESS");
             }
+            // Pré-resolve a próxima da fila em background (transição sem espera).
+            prefetchProxima(state);
         } else {
-            const metadata = await metadataPromise;
-            metadata.requestedBy = message.author.id;
-            metadata.query = query;
-
-            state.queue.push(metadata);
+            if (filaCheia()) {
+                return message.reply(`❌ A fila está cheia (limite de ${MAX_QUEUE}). Use \`!skip\` ou \`!remove\` para liberar espaço.`);
+            }
+            // PLAY IMEDIATO: cria o placeholder, começa o stream NA HORA
+            // (reaproveitando a extração já em andamento) e completa o painel
+            // quando os metadados chegarem. Corta ~8s do caminho crítico.
+            const placeholder = {
+                title: null, // painel mostra "Buscando dados da faixa..."
+                url: null,
+                thumbnail: null,
+                uploader: null,
+                duration: null,
+                isOpus: null,
+                requestedBy: message.author.id,
+                query,
+            };
+            state.queue.push(placeholder);
 
             if (state.queue.length === 1) {
-                state.current = metadata;
-                iniciarReproducao(state, metadata);
-                
-                await enviarNovoPainel(message.channel, state, metadata);
-                savePlayLog(guildId, message.author.id, query, metadata.title, "SUCCESS");
+                state.current = placeholder;
+                const metaP = iniciarFaixaOtimista(state, placeholder, query, searchEngine, 0, metadataPromise.then((meta) => {
+                    placeholder.title = meta.title;
+                    placeholder.url = meta.url;
+                    placeholder.uploader = meta.uploader;
+                    placeholder.thumbnail = meta.thumbnail;
+                    placeholder.isOpus = meta.isOpus;
+                    placeholder.duration = meta.duration;
+                    return placeholder;
+                }));
+                await enviarNovoPainel(message.channel, state, placeholder).catch(() => {});
+                try {
+                    await metaP;
+                } catch (err) {
+                    // Extração falhou: remove o placeholder e informa o motivo.
+                    state.queue = state.queue.filter(s => s !== placeholder);
+                    if (state.current === placeholder) state.current = null;
+                    console.error("Erro no processamento:", err);
+                    savePlayLog(guildId, message.author.id, query, null, "FAILED", err.message);
+                    return message.reply(err.message || "Deu erro ao buscar a música.");
+                }
+                await enviarNovoPainel(message.channel, state, placeholder).catch(() => {});
+                savePlayLog(guildId, message.author.id, query, placeholder.title, "SUCCESS");
             } else {
-                message.reply(`✅ Adicionado à fila: **${metadata.title}**`);
+                // Entrou na fila: resolve o título em background para o !queue
+                // mostrar algo útil, sem bloquear o usuário.
+                metadataPromise.then((meta) => {
+                    placeholder.title = meta.title;
+                    placeholder.url = meta.url;
+                    placeholder.uploader = meta.uploader;
+                    placeholder.thumbnail = meta.thumbnail;
+                    placeholder.isOpus = meta.isOpus;
+                    placeholder.duration = meta.duration;
+                }).catch((err) => {
+                    state.queue = state.queue.filter(s => s !== placeholder);
+                    message.reply(err.message || "Deu erro ao buscar a música.").catch(() => {});
+                });
+                message.reply(`🔍 Buscando **${query}**... entro na fila assim que resolver.`).catch(() => {});
+                prefetchProxima(state);
             }
         }
     } catch (error) {
@@ -387,14 +593,21 @@ async function playNow(message, query) {
         if (isPlaylistUrl(query)) {
             message.reply("🔍 Processando fura-fila de playlist... Isso pode levar alguns segundos.");
             const { playlistTitle, songs } = await getPlaylistMetadata(query);
-            
+
             if (!songs || songs.length === 0) {
                 return message.reply("❌ Não encontrei nenhuma música válida nessa playlist.");
             }
 
-            songs.reverse().forEach(song => {
+            const espacoLivre = Math.max(0, MAX_QUEUE - state.queue.length);
+            if (espacoLivre <= 0) {
+                return message.reply(`❌ A fila está cheia (limite de ${MAX_QUEUE}).`);
+            }
+            const paraAdicionar = songs.slice(0, espacoLivre);
+
+            paraAdicionar.reverse().forEach(song => {
                 song.requestedBy = message.author.id;
                 song.query = song.url;
+                song.isOpus = song.isOpus ?? null;
 
                 if (state.queue.length <= 1) {
                     state.queue.push(song);
@@ -403,9 +616,15 @@ async function playNow(message, query) {
                 }
             });
 
-            message.reply(`⚡ **Fura-Fila:** **${songs.length} músicas** da playlist **"${playlistTitle}"** foram colocadas no topo da fila!`);
+            const avisoLimite = songs.length > paraAdicionar.length
+                ? ` (limite de ${MAX_QUEUE} — ${songs.length - paraAdicionar.length} ficaram de fora)`
+                : '';
+            message.reply(`⚡ **Fura-Fila:** **${paraAdicionar.length} músicas** da playlist **"${playlistTitle}"** foram colocadas no topo da fila!${avisoLimite}`);
 
         } else {
+            if (state.queue.length >= MAX_QUEUE) {
+                return message.reply(`❌ A fila está cheia (limite de ${MAX_QUEUE}).`);
+            }
             const metadata = await getAudioMetadata(query);
             metadata.requestedBy = message.author.id;
             metadata.query = query;
@@ -420,15 +639,16 @@ async function playNow(message, query) {
         }
     } catch (error) {
         console.error("Erro no playNow:", error);
-        message.reply("Deu erro ao processar o fura-fila.");
+        savePlayLog(guildId, message.author.id, query, null, "FAILED", error.message);
+        message.reply(error.message || "Deu erro ao processar o fura-fila.");
     }
 }
 
 function stop(guildId) {
     const state = states.get(guildId);
     if (!state) return;
-    if (state.progressTimeout) { clearTimeout(state.progressTimeout); state.progressTimeout = null; }
-    if (state.progressInterval) clearInterval(state.progressInterval);
+    limparTimersProgresso(state);
+    pararStreamAtual(state);
     state.queue = [];
     state.current = null;
     state.player.stop();
@@ -438,10 +658,33 @@ function stop(guildId) {
     states.delete(guildId);
 }
 
+// Desconecta e limpa tudo quando o canal de voz esvazia ou o bot desliga.
+// Reaproveitado pelo voiceStateUpdate e pelo shutdown gracioso.
+function cleanupVoiceState(guildId) {
+    const state = states.get(guildId);
+    if (!state) return false;
+    limparTimersProgresso(state);
+    pararStreamAtual(state);
+    try {
+        if (state.player) state.player.stop(true);
+    } catch (err) {
+        // Player já parado — nada a fazer.
+    }
+    try {
+        if (state.connection) state.connection.destroy();
+    } catch (err) {
+        console.error("Erro ao destruir conexão:", err);
+    }
+    states.delete(guildId);
+    return true;
+}
+
 function skip(guildId) {
     const state = states.get(guildId);
     if (!state || !state.current) return false;
-    state.player.stop(); 
+    // O stream antigo é morto dentro de iniciarReproducao quando a próxima
+    // faixa começa; o player.stop() aqui dispara o stateChange -> idle.
+    state.player.stop();
     return true;
 }
 
@@ -473,6 +716,30 @@ function toggleAutoplay(guildId) {
     if (!state) return null;
     state.autoplay = !state.autoplay;
     return state.autoplay;
+}
+
+// Loop da faixa atual: ao terminar, retoca do zero em vez de avançar a fila.
+// Custo zero de CPU/RAM (só um boolean + reuso do path de restart).
+function toggleLoop(guildId) {
+    const state = states.get(guildId);
+    if (!state) return null;
+    state.loop = !state.loop;
+    return state.loop;
+}
+
+// Move uma faixa dentro da fila (posições do !queue: 1 = primeira após a atual).
+// Retorna { title } ou { error: '...' }. Sem custo extra: só splice no array.
+function moverNaFila(guildId, de, para) {
+    const state = states.get(guildId);
+    if (!state || state.queue.length <= 1) return { error: 'fila_vazia' };
+    const max = state.queue.length - 1;
+    if (!Number.isInteger(de) || !Number.isInteger(para) || de < 1 || de > max || para < 1 || para > max) {
+        return { error: 'fora_dos_limites', total: max };
+    }
+    if (de === para) return { error: 'mesma_posicao' };
+    const [faixa] = state.queue.splice(de, 1);
+    state.queue.splice(para, 0, faixa);
+    return { title: faixa.title || 'Faixa sem título' };
 }
 
 function restart(guildId) {
@@ -655,14 +922,24 @@ function removerFaixaPlaylist(userId, playlistName, posicao) {
                         if (err) return reject(err);
                         if (!track) return resolve({ status: 'posicao_invalida' });
 
-                        playlistDb.serialize(() => {
-                            // Deleta a música alvo
-                            playlistDb.run(`DELETE FROM playlist_tracks WHERE playlist_id = ? AND position = ?`, [playlistId, posicao]);
-                            // Ajusta a posição de todas as músicas que vinham depois dela (-1) para não deixar buracos na numeração
-                            playlistDb.run(`UPDATE playlist_tracks SET position = position - 1 WHERE playlist_id = ? AND position > ?`, [playlistId, posicao]);
-                        });
-
-                        resolve({ status: 'removido', title: track.title });
+                        // Encadeia via callbacks: só resolve DEPOIS que DELETE +
+                        // UPDATE terminarem (o código antigo resolvia antes).
+                        playlistDb.run(
+                            `DELETE FROM playlist_tracks WHERE playlist_id = ? AND position = ?`,
+                            [playlistId, posicao],
+                            (err) => {
+                                if (err) return reject(err);
+                                // Ajusta a posição de todas as músicas que vinham depois dela (-1) para não deixar buracos na numeração
+                                playlistDb.run(
+                                    `UPDATE playlist_tracks SET position = position - 1 WHERE playlist_id = ? AND position > ?`,
+                                    [playlistId, posicao],
+                                    (err) => {
+                                        if (err) return reject(err);
+                                        resolve({ status: 'removido', title: track.title });
+                                    }
+                                );
+                            }
+                        );
                     }
                 );
             }
@@ -747,26 +1024,35 @@ function tocarPlaylist(message, userId, playlistName) {
                     async (err, tracks) => {
                         if (err) return reject(err);
                         if (tracks.length === 0) return resolve(false);
-                        const primeiraFaixa = tracks.shift(); 
-                        await play(message, primeiraFaixa.url); 
-                        setTimeout(() => {
+                        try {
+                            // Toca a 1ª faixa e espera a sessão existir antes de
+                            // enfileirar o resto — sem o setTimeout(1000) antigo,
+                            // que perdia faixas se o play() demorasse mais que isso.
+                            const [primeiraFaixa, ...resto] = tracks;
+                            await play(message, primeiraFaixa.url);
+
                             const guildId = message.guild.id;
                             const state = states.get(guildId);
-                            
-                            if (state) {
-                                tracks.forEach(track => {
-                                    state.queue.push({
-                                        title: track.title,
-                                        url: track.url,
-                                        thumbnail: track.thumbnail,
-                                        uploader: track.uploader,
-                                        duration: track.duration,
-                                        requestedBy: message.author.id
-                                    });
+                            if (!state) return resolve(false);
+
+                            const espacoLivre = Math.max(0, MAX_QUEUE - state.queue.length);
+                            const paraAdicionar = resto.slice(0, espacoLivre);
+                            paraAdicionar.forEach(track => {
+                                state.queue.push({
+                                    title: track.title,
+                                    url: track.url,
+                                    thumbnail: track.thumbnail,
+                                    uploader: track.uploader,
+                                    duration: track.duration,
+                                    isOpus: null,
+                                    query: track.url,
+                                    requestedBy: message.author.id
                                 });
-                            }
+                            });
                             resolve(true);
-                        }, 1000);
+                        } catch (playErr) {
+                            reject(playErr);
+                        }
                     }
                 );
             }
@@ -895,4 +1181,4 @@ function removeFromQueue(guildId, posicao) {
     return removida.title;
 }
 
-module.exports = { play, stop, skip, restart, pause, resume, toggleAutoplay, playNow, criarPainelMusical, adicionarAosCurtidos, shuffleQueue, removeFromQueue, seek, parseSeekInput, criarPlaylist, excluirPlaylist, renomearPlaylist, adicionarFaixaPlaylist, removerFaixaPlaylist, moverFaixaPlaylist, tocarPlaylist, listarPlaylist, listarTodasPlaylists, listarPlaylistsDoServidor, states };
+module.exports = { play, stop, cleanupVoiceState, limparTimersProgresso, skip, restart, pause, resume, toggleAutoplay, toggleLoop, moverNaFila, playNow, criarPainelMusical, calcularElapsedMs, adicionarAosCurtidos, shuffleQueue, removeFromQueue, seek, parseSeekInput, criarPlaylist, excluirPlaylist, renomearPlaylist, adicionarFaixaPlaylist, removerFaixaPlaylist, moverFaixaPlaylist, tocarPlaylist, listarPlaylist, listarTodasPlaylists, listarPlaylistsDoServidor, iniciarFaixaOtimista, prefetchProxima, garantirMetadadosCompletos, MAX_QUEUE, states };

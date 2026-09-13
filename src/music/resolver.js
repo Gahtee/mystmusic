@@ -1,9 +1,36 @@
-const { spawn, exec } = require('child_process');
+const { spawn, execFile } = require('child_process');
 const util = require('util');
-const execPromise = util.promisify(exec);
+const path = require('path');
+const fs = require('fs');
+const execFilePromise = util.promisify(execFile);
+
+// Caminho absoluto para o cookies.txt (raiz do projeto). Evita depender do cwd
+// e deixa claro que o arquivo é secreto (já está no .gitignore).
+const COOKIES_PATH = path.resolve(__dirname, '../../cookies.txt');
+
+// Se o cookies.txt não existir (ex: ambiente novo), omite o flag em vez de
+// fazer o yt-dlp falhar.
+function cookieArgs() {
+    try {
+        if (fs.existsSync(COOKIES_PATH)) return ['--cookies', COOKIES_PATH];
+    } catch (err) {
+        // Ignora e segue sem cookies.
+    }
+    return [];
+}
+
+const YTDLP_TIMEOUT_MS = 30_000;
+const YTDLP_MAX_BUFFER = 1024 * 1024 * 20;
+
+function stderrOf(err) {
+    if (!err) return '';
+    if (typeof err.stderr === 'string') return err.stderr;
+    if (Buffer.isBuffer(err.stderr)) return err.stderr.toString('utf8');
+    return '';
+}
 
 function friendlyExtractionError(err, query) {
-    const stderr = err.stderr || '';
+    const stderr = stderrOf(err);
 
     if (/DRM protected/i.test(stderr)) {
         return new Error('🔒 Essa faixa é protegida por DRM e não pode ser reproduzida (comum em faixas de selo/gravadora no SoundCloud).');
@@ -24,72 +51,208 @@ function friendlyExtractionError(err, query) {
         : `Falha ao buscar "${query}".`);
 }
 
-async function getAudioMetadata(query, searchEngine = 'ytsearch') {
-    let target;
-    if (query.startsWith('http://') || query.startsWith('https://')) {
-        target = `"${query}"`;
-    } else {
-        target = `"${searchEngine}1:${query}"`;
-    }
-
-    const cmd = `yt-dlp --cookies cookies.txt --js-runtimes node --no-playlist -f "bestaudio[acodec=opus]/bestaudio/best" --print "%(title)s\n%(webpage_url)s\n%(uploader)s\n%(acodec)s\n%(thumbnail)s\n%(duration)s" ${target}`;
-
-    let stdout;
-    try {
-        ({ stdout } = await execPromise(cmd));
-    } catch (err) {
+// execFile sem shell: query/URL vão como argumentos discretos, sem interpolação
+// em string de shell — elimina injeção de comando via `;`, `$()`, etc.
+function ytDlpJson(args, query) {
+    return execFilePromise('yt-dlp', args, {
+        timeout: YTDLP_TIMEOUT_MS,
+        maxBuffer: YTDLP_MAX_BUFFER,
+    }).catch((err) => {
         throw friendlyExtractionError(err, query);
-    }
-    const lines = stdout.trim().split('\n');
+    });
+}
 
-    const pageUrl = lines[1] ? lines[1].trim() : null;
+// Cache LRU simples com TTL: termos buscados e URLs se repetem muito entre
+// servidores. Evita um yt-dlp inteiro (~8s) nas repetições.
+// Lives (duration null) mudam de metadados — TTL curto para não congelar título.
+const CACHE_TTL_MS = 60 * 60 * 1000; // 1h para VODs
+const CACHE_TTL_LIVE_MS = 10 * 60 * 1000; // 10min para lives (duration desconhecida)
+const CACHE_MAX = 300;
+const metadataCache = new Map(); // chave -> { value, expires }
+
+function cacheGet(key) {
+    const hit = metadataCache.get(key);
+    if (!hit) return null;
+    if (Date.now() > hit.expires) {
+        metadataCache.delete(key);
+        return null;
+    }
+    // Refresh LRU: re-insere para marcar como recente.
+    metadataCache.delete(key);
+    metadataCache.set(key, hit);
+    return hit.value;
+}
+
+function cacheSet(key, value, ttl = CACHE_TTL_MS) {
+    if (metadataCache.size >= CACHE_MAX) {
+        const oldest = metadataCache.keys().next().value;
+        metadataCache.delete(oldest);
+    }
+    metadataCache.set(key, { value, expires: Date.now() + ttl });
+}
+
+function pickThumbnail(data) {
+    if (typeof data.thumbnail === 'string' && data.thumbnail !== 'NA') {
+        return data.thumbnail.trim();
+    }
+    // No --dump-single-json o campo `thumbnail` pode vir ausente; `thumbnails`
+    // é um array ordenado (menor -> maior). Pega o maior disponível.
+    if (Array.isArray(data.thumbnails) && data.thumbnails.length > 0) {
+        const last = data.thumbnails[data.thumbnails.length - 1];
+        if (last && last.url) return last.url;
+    }
+    return null;
+}
+
+// Extrai a URL da página de um objeto de vídeo. Quando -f seleciona o formato,
+// `url` pode ser o link direto do stream (googlevideo) — webpage_url/id são a
+// página canônica que o painel precisa para título/link/thumbnail.
+function resolvePageUrl(data, query) {
+    const page = (data.webpage_url && String(data.webpage_url).trim()) || null;
+    if (page && page !== 'NA' && !/^ytsearch\d*:/i.test(page) && !/^scsearch\d*:/i.test(page)) {
+        return page;
+    }
+    if (data.id && /^[a-zA-Z0-9_-]{11}$/.test(String(data.id))) {
+        return `https://www.youtube.com/watch?v=${data.id}`;
+    }
+    // SoundCloud: id não é o slug — usa url/webpage_url como fallback.
+    const fallback = (data.url && String(data.url).trim())
+        || (data.webpage_url && String(data.webpage_url).trim())
+        || null;
+    if (fallback && /^https?:\/\//.test(fallback) && !/googlevideo\.com/.test(fallback)) {
+        return fallback;
+    }
+    return page;
+}
+
+// Normaliza o objeto final de metadados a partir do JSON do yt-dlp
+// (vídeo direto ou entry de busca). Reaproveitado pelo fast-path e pelo
+// preenchimento tardio do play imediato.
+function normalizeMetadata(data, query) {
+    // Busca por texto (ytsearch1:/scsearch1:) retorna um wrapper
+    // `{ _type: 'playlist', entries: [video] }` e NÃO o vídeo direto:
+    // title vira o termo buscado, webpage_url vira "ytsearch1:..." e
+    // duration/uploader vêm null. Desembrulha para a primeira entry.
+    if (data && data._type === 'playlist' && Array.isArray(data.entries)) {
+        const first = data.entries.find((e) => e && (e.webpage_url || e.id || e.url));
+        if (!first) {
+            throw new Error(`Não encontrei resultado para: ${query}`);
+        }
+        data = first;
+    }
+
+    const pageUrl = resolvePageUrl(data, query);
 
     if (!pageUrl || pageUrl === 'NA') {
         throw new Error(`Não foi possível extrair uma URL válida para: ${query}`);
     }
 
-    const duracao = parseFloat(lines[5]);
+    const duracao = typeof data.duration === 'number' ? data.duration : parseFloat(data.duration);
 
     return {
-        title: lines[0],
+        title: data.title || 'Título indisponível',
         url: pageUrl,
-        thumbnail: (lines[4] && lines[4] !== 'NA') ? lines[4].trim() : null,
-        uploader: lines[2] || "Desconhecido",
-        isOpus: (lines[3] || '').trim() === 'opus',
-        duration: Number.isFinite(duracao) ? duracao : null
+        thumbnail: pickThumbnail(data),
+        uploader: data.uploader || data.channel || 'Desconhecido',
+        isOpus: typeof data.acodec === 'string' ? data.acodec.trim() === 'opus' : null,
+        duration: Number.isFinite(duracao) ? duracao : null,
     };
+}
+
+async function getAudioMetadata(query, searchEngine = 'ytsearch') {
+    const cacheKey = `${searchEngine}::${query}`;
+    const cached = cacheGet(cacheKey);
+    if (cached) return { ...cached };
+
+    const isUrl = query.startsWith('http://') || query.startsWith('https://');
+    // Passado como UM argumento ao yt-dlp, sem shell: seguro contra injeção.
+    const target = isUrl ? query : `${searchEngine}1:${query}`;
+
+    const args = [
+        ...cookieArgs(),
+        '--js-runtimes', 'node',
+        '--no-playlist',
+        '-f', 'bestaudio[acodec=opus]/bestaudio/best',
+        '--dump-single-json',
+        '--no-warnings',
+        target,
+    ];
+
+    const { stdout } = await ytDlpJson(args, query);
+
+    let data;
+    try {
+        data = JSON.parse(stdout);
+    } catch (err) {
+        throw new Error(`Falha ao buscar "${query}": resposta inválida do extrator.`);
+    }
+
+    const meta = normalizeMetadata(data, query);
+    // Lives têm duration null e metadados voláteis — TTL curto.
+    const ttl = meta.duration ? CACHE_TTL_MS : CACHE_TTL_LIVE_MS;
+    cacheSet(cacheKey, meta, ttl);
+    // Cache também pela URL canônica: queue[1]/autoplay chegam com URL direta.
+    if (meta.url && meta.url !== query) cacheSet(`ytsearch::${meta.url}`, meta, ttl);
+    return meta;
 }
 
 async function getPlaylistMetadata(playlistUrl) {
+    const args = [
+        ...cookieArgs(),
+        '--js-runtimes', 'node',
+        '--flat-playlist',
+        '--playlist-end', '100',
+        '--dump-single-json',
+        '--no-warnings',
+        playlistUrl,
+    ];
 
-    const cmd = `yt-dlp --cookies cookies.txt --js-runtimes node --flat-playlist --playlist-end 100 --dump-single-json "${playlistUrl}"`;
+    const { stdout } = await ytDlpJson(args, playlistUrl);
 
-    let stdout;
+    let playlistData;
     try {
-        ({ stdout } = await execPromise(cmd, { maxBuffer: 1024 * 1024 * 20 }));
+        playlistData = JSON.parse(stdout);
     } catch (err) {
-        throw friendlyExtractionError(err, playlistUrl);
+        throw new Error('Falha ao processar a playlist: resposta inválida do extrator.');
     }
-    const playlistData = JSON.parse(stdout);
-    const songs = playlistData.entries.map(entry => ({
-        title: entry.title,
-        url: entry.url || entry.webpage_url || (entry.id ? `https://www.youtube.com/watch?v=${entry.id}` : null),
-        thumbnail: entry.thumbnail || (entry.id ? `https://img.youtube.com/vi/${entry.id}/hqdefault.jpg` : null),
-        uploader: entry.uploader || entry.channel || "Desconhecido",
-        duration: entry.duration || null,
 
-        isOpus: null
-    }));
+    const entries = Array.isArray(playlistData.entries) ? playlistData.entries : [];
+
+    const songs = entries
+        .map((entry) => {
+            // Vídeos privados/deletados vêm sem url/id — filtrados abaixo.
+            const url = entry.url
+                || entry.webpage_url
+                || (entry.id ? `https://www.youtube.com/watch?v=${entry.id}` : null);
+            return {
+                title: entry.title,
+                url,
+                thumbnail: entry.thumbnail || (entry.id ? `https://img.youtube.com/vi/${entry.id}/hqdefault.jpg` : null),
+                uploader: entry.uploader || entry.channel || 'Desconhecido',
+                duration: entry.duration || null,
+                isOpus: null,
+            };
+        })
+        // Remove placeholders de vídeos indisponíveis (privado/deletado) que
+        // quebrariam o getAudioStream depois.
+        .filter((s) => typeof s.url === 'string' && s.url.length > 0);
 
     return {
         playlistTitle: playlistData.title,
-        songs: songs
+        songs,
     };
 }
 
+// Os processos filhos ficam anexados ao stream em `stream._childProcesses`
+// para que o manager possa matá-los em skip/stop/restart/seek.
+function attachProcesses(stream, processes) {
+    stream._childProcesses = processes;
+    return stream;
+}
+
 function getAudioStream(url, seekSec = 0) {
-    const args = [
-        '--cookies', 'cookies.txt',
+    const baseArgs = [
+        ...cookieArgs(),
         '-f', 'bestaudio[acodec=opus]/bestaudio/best',
         '--js-runtimes', 'node',
         '-o', '-',
@@ -102,8 +265,7 @@ function getAudioStream(url, seekSec = 0) {
     // para streams ao vivo e formatos não-WebM). O yt-dlp emite o áudio bruto e o
     // ffmpeg corta e re-codifica para Opus/ogg que o Discord entende sem problemas.
     if (seekSec > 0) {
-        args.push(url);
-        const ytProcess = spawn('yt-dlp', args);
+        const ytProcess = spawn('yt-dlp', [...baseArgs, url]);
         ytProcess.stderr.on('data', d => console.error(`[yt-dlp seek error]: ${d}`));
         ytProcess.on('error', err => console.error('[SPAWN ERROR yt-dlp seek]:', err));
 
@@ -130,12 +292,15 @@ function getAudioStream(url, seekSec = 0) {
         ytProcess.stdout.on('error', () => ffProcess.stdin.destroy());
         ffProcess.stdin.on('error', () => {}); // evita crash por broken pipe
 
-        return ffProcess.stdout;
+        // Se o ffmpeg morre, não deixa o yt-dlp órfão bombeando bytes.
+        ffProcess.on('close', () => {
+            if (!ytProcess.killed) ytProcess.kill('SIGKILL');
+        });
+
+        return attachProcesses(ffProcess.stdout, [ytProcess, ffProcess]);
     }
 
-    args.push(url);
-
-    const ytProcess = spawn('yt-dlp', args);
+    const ytProcess = spawn('yt-dlp', [...baseArgs, url]);
 
     ytProcess.stderr.on('data', (data) => {
         console.error(`[yt-dlp error]: ${data}`);
@@ -145,7 +310,22 @@ function getAudioStream(url, seekSec = 0) {
         console.error('[SPAWN ERROR]: Falha ao iniciar o yt-dlp:', err);
     });
 
-    return ytProcess.stdout; 
+    return attachProcesses(ytProcess.stdout, [ytProcess]);
 }
 
-module.exports = { getAudioMetadata, getAudioStream, getPlaylistMetadata };
+// Mata os processos de stream anteriores. Chamado antes de cada nova reprodução,
+// skip, stop, restart e seek para não deixar yt-dlp/ffmpeg órfãos.
+function killStreamProcesses(stream) {
+    const procs = stream && stream._childProcesses;
+    if (!Array.isArray(procs)) return;
+    for (const p of procs) {
+        try {
+            if (!p.killed && p.exitCode === null) p.kill('SIGKILL');
+        } catch (err) {
+            // Processo já encerrado — nada a fazer.
+        }
+    }
+    stream._childProcesses = [];
+}
+
+module.exports = { getAudioMetadata, getAudioStream, getPlaylistMetadata, killStreamProcesses, normalizeMetadata, _cache: { get: cacheGet, set: cacheSet, clear: () => metadataCache.clear() } };
