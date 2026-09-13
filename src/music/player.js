@@ -15,7 +15,7 @@ function playStream(player, audioStream, streamType = StreamType.WebmOpus) {
     resource.playStream.on('end', () => console.log('[STREAM END] O fluxo terminou.'));
 
     player.play(resource);
-    return player;
+    return resource;
 }
 
 module.exports = { playStream };

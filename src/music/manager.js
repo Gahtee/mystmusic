@@ -187,6 +187,8 @@ async function enviarNovoPainel(channel, state, metadata) {
 
 // Centraliza a decisão de qual StreamType usar e o retry automático.
 // song.isOpus: true (confirmado), false (confirmado outro codec) ou null/undefined (desconhecido, ex: playlists).
+// Retorna o AudioResource criado (o chamador pode comparar resource === state.resource
+// para saber se um idle pertence ao stream atual ou a um stream antigo já superado).
 function iniciarReproducao(state, song, forcarTranscodificacao = false, seekSec = 0) {
     // Mata o stream anterior antes de criar o novo — sem isso cada skip/seek
     // deixava um yt-dlp (+ffmpeg) órfão consumindo banda/CPU.
@@ -205,7 +207,8 @@ function iniciarReproducao(state, song, forcarTranscodificacao = false, seekSec 
 
     const audioStream = getAudioStream(song.url, seekSec);
     state.audioStream = audioStream;
-    playStream(state.player, audioStream, streamType);
+    state.resource = playStream(state.player, audioStream, streamType);
+    return state.resource;
 }
 
 // Inicia uma faixa otimista: o stream começa IMEDIATAMENTE com o que já se
@@ -233,7 +236,7 @@ function iniciarFaixaOtimista(state, song, query, searchEngine = 'ytsearch', see
 
     const audioStream = getAudioStream(streamTarget, seekSec);
     state.audioStream = audioStream;
-    playStream(state.player, audioStream, streamType);
+    state.resource = playStream(state.player, audioStream, streamType);
 
     // Metadados em paralelo (cache cobre repetições em ~0ms).
     // Se o chamador já tem uma extração em andamento, reaproveita.
@@ -297,6 +300,44 @@ async function garantirMetadadosCompletos(song) {
     return song;
 }
 
+// Faixa já tem dados suficientes para um painel final? Se sim, o chamador
+// manda UM painel só em vez de provisório + completo (menos flicker,
+// menos chance de órfão duplicado).
+function temMetadadosCompletos(song) {
+    return !!(song && song.title && song.url && song.duration);
+}
+
+// IDs já tocados/enfileirados recentemente (anti-repetição do autoplay).
+function registrarIdRecente(state, song) {
+    try {
+        const id = extrairYoutubeId(song?.url);
+        if (!id) return;
+        if (!state.recentIds) state.recentIds = new Set();
+        state.recentIds.add(id);
+        // Cap: Set itera em ordem de inserção — descarta os mais antigos.
+        while (state.recentIds.size > 100) {
+            state.recentIds.delete(state.recentIds.values().next().value);
+        }
+    } catch {
+        // Best-effort: nunca pode quebrar a reprodução.
+    }
+}
+
+// Filtra candidatas do autoplay removendo o que já está na fila/atual/recente.
+function filtrarRelacionadasNovas(state, candidatas) {
+    const vistos = new Set(state?.recentIds || []);
+    const atual = extrairYoutubeId(state?.current?.url);
+    if (atual) vistos.add(atual);
+    for (const s of state?.queue || []) {
+        const id = extrairYoutubeId(s?.url);
+        if (id) vistos.add(id);
+    }
+    return (candidatas || []).filter(s => {
+        const id = extrairYoutubeId(s?.url);
+        return id && !vistos.has(id);
+    });
+}
+
 // Detecta playlist tanto do YouTube (?list=...) quanto do SoundCloud (.../sets/...).
 function isPlaylistUrl(query) {
     return query.includes('list=') || /soundcloud\.com\/[^/]+\/sets\//i.test(query);
@@ -356,10 +397,45 @@ async function play(message, query, searchEngine = 'ytsearch') {
         });
 
         // Loop da Fila Automática (Quando a música termina)
-        serverPlayer.on('stateChange', async (oldState, newState) => {
-            if (newState.status === 'idle' && oldState.status !== 'idle') {
-                const currentState = states.get(guildId);
-                if (!currentState) return;
+        // O @discordjs/voice 0.19 emite 'idle' 2x na mesma transição quando a
+        // troca de resource acontece rápido (fallback Arbitrary que falha,
+        // buffering->idle), e o handler antigo fazia shift() + painel a cada
+        // evento — 1 fim de faixa gerava 2 painéis ("mostrou 2x" no autoplay).
+        // Correção em 2 camadas:
+        //  (a) resourceDoEvento: só o idle do resource ATUAL avança a fila;
+        //      idle de resource antigo (já substituído) é ignorado.
+        //  (b) transitioning+generation: transição em andamento bloqueia
+        //      entrada duplicada; continuação perdedora aborta após o await.
+        serverPlayer.on('stateChange', (oldState, newState) => {
+            const foiParaIdle = newState?.status === 'idle' && oldState?.status !== 'idle';
+            if (!foiParaIdle) return;
+            // (a): idle de resource antigo — player já está tocando/buffering
+            // outra coisa, então este evento é obsoleto. Compara o resource do
+            // EVENTO (oldState.resource morreu) com o resource atual do player:
+            // se o player já tem resource diferente em playing/buffering/paused,
+            // ignora.
+            try {
+                const statusAgora = serverPlayer?.state?.status;
+                const resourceAgora = serverPlayer?.state?.resource;
+                const resourceQueMorreu = oldState?.resource;
+                const tocandoOutraCoisa = (statusAgora === 'playing' || statusAgora === 'buffering' || statusAgora === 'paused')
+                    && resourceAgora && resourceQueMorreu && resourceAgora !== resourceQueMorreu;
+                if (tocandoOutraCoisa) return;
+            } catch { /* best-effort */ }
+            queueMicrotask(() => processarIdle(guildId));
+        });
+
+        async function processarIdle(guildId) {
+            const currentState = states.get(guildId);
+            if (!currentState) return;
+
+            // (b1): transição já em andamento — ignora a duplicada.
+            if (currentState.transitioning) {
+                console.warn(`⚠️ Transição ignorada (já em andamento) no servidor ${guildId}.`);
+                return;
+            }
+            currentState.transitioning = true;
+            try {
 
                 // Loop de faixa: não avança a fila, retoca a atual do zero.
                 // Equivale a um restart automático (sem duplicar referência).
@@ -375,11 +451,29 @@ async function play(message, query, searchEngine = 'ytsearch') {
 
                 if (currentState.queue.length > 0) {
                     currentState.current = currentState.queue[0];
+                    registrarIdRecente(currentState, currentState.current);
+                    // Painel ÚNICO por transição: provisório só se faltar dado.
+                    // O painel antigo é DELETADO dentro do enviarNovoPainel,
+                    // então duplicata visível = duas transições concorrentes
+                    // (ver guards transitioning+generation abaixo) ou um segundo
+                    // painel enviado por outro caminho (ex: seek/next).
+                    const painelProvisorio = !temMetadadosCompletos(currentState.current);
+
+                    // Guarda contra transição concorrente: se outra troca de faixa
+                    // começar enquanto awaitamos os metadados (stream otimista que
+                    // falha rápido, skip duplo, etc.), endTransicao roda 2x e o
+                    // painel/log duplicam (foi o bug do autoplay "mostrou 2x").
+                    // (Belt + suspenders: transitioning bloqueia entry duplicada,
+                    // geração aborta a continuação perdedora.)
+                    const minhaGeracao = (currentState.generation = (currentState.generation || 0) + 1);
 
                     // Play imediato: stream começa já, metadados completam em
                     // paralelo (ou já vieram do pré-fetch) e o painel atualiza.
+                    const faixaIniciada = currentState.current;
                     const metaP = iniciarFaixaOtimista(currentState, currentState.current, currentState.current.query);
-                    enviarNovoPainel(currentState.textChannel, currentState, currentState.current).catch(() => {});
+                    if (painelProvisorio) {
+                        enviarNovoPainel(currentState.textChannel, currentState, currentState.current).catch(() => {});
+                    }
                     prefetchProxima(currentState);
 
                     try {
@@ -389,6 +483,14 @@ async function play(message, query, searchEngine = 'ytsearch') {
                     }
 
                     // Atualiza o painel com os dados completos (título, thumbnail).
+                    // Guarda dupla: geração mudou (nova transição assumiu) ou a
+                    // faixa atual trocou durante o await — NÃO reenvia, a nova
+                    // transição já mandou o próprio painel. Sem isso cada falha
+                    // rápida gerava painel duplicado.
+                    // Se a faixa já tinha metadados e NÃO mandamos provisório,
+                    // o painel único vai AGORA (evita faixa sem painel).
+                    if (currentState.generation !== minhaGeracao
+                        || currentState.current !== faixaIniciada) return;
                     if (currentState.textChannel && currentState.current) {
                         await enviarNovoPainel(currentState.textChannel, currentState, currentState.current).catch(() => {});
                     }
@@ -403,8 +505,8 @@ async function play(message, query, searchEngine = 'ytsearch') {
                     if (idAtual) {
                         try {
                             const resultado = await getPlaylistMetadata(`https://www.youtube.com/watch?v=${idAtual}&list=RD${idAtual}`);
-                            relacionadas = (resultado.songs || [])
-                                .filter(s => extrairYoutubeId(s.url) !== idAtual)
+                            relacionadas = filtrarRelacionadasNovas(currentState, (resultado.songs || [])
+                                .filter(s => extrairYoutubeId(s.url) !== idAtual))
                                 .slice(0, 5);
                         } catch (err) {
                             console.error('Autoplay: falha ao buscar relacionados:', err.message);
@@ -412,11 +514,16 @@ async function play(message, query, searchEngine = 'ytsearch') {
                     }
 
                     if (relacionadas.length > 0) {
-                        relacionadas.forEach(s => { s.requestedBy = null; s.query = s.url; });
+                        relacionadas.forEach(s => { s.requestedBy = null; s.query = s.url; registrarIdRecente(currentState, s); });
                         currentState.queue.push(...relacionadas);
                         currentState.current = currentState.queue[0];
+                        registrarIdRecente(currentState, currentState.current);
+                        const minhaGeracao = (currentState.generation = (currentState.generation || 0) + 1);
 
+                        const faixaIniciada = currentState.current;
                         const metaP = iniciarFaixaOtimista(currentState, currentState.current, currentState.current.query);
+                        // Autoplay sempre chega com flat-playlist (sem duration) →
+                        // provisório no início, final após os metadados.
                         if (currentState.textChannel) {
                             currentState.textChannel.send(`📻 **Autoplay:** adicionei ${relacionadas.length} música(s) relacionada(s) à fila.`).catch(() => {});
                             await enviarNovoPainel(currentState.textChannel, currentState, currentState.current).catch(() => {});
@@ -424,6 +531,8 @@ async function play(message, query, searchEngine = 'ytsearch') {
                         try { await metaP; } catch (err) {
                             console.error('Autoplay: falha nos metadados:', err.message);
                         }
+                        if (currentState.generation !== minhaGeracao
+                            || currentState.current !== faixaIniciada) return;
                         if (currentState.textChannel && currentState.current) {
                             await enviarNovoPainel(currentState.textChannel, currentState, currentState.current).catch(() => {});
                         }
@@ -435,8 +544,12 @@ async function play(message, query, searchEngine = 'ytsearch') {
                 } else {
                     currentState.current = null;
                 }
+            } catch (err) {
+                console.error(`Erro na transição de faixa (${guildId}):`, err?.message || err);
+            } finally {
+                currentState.transitioning = false;
             }
-        });
+        }
 
         // Configuração inicial do Estado do Servidor
         state = {
