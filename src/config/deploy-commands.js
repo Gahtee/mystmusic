@@ -1,55 +1,107 @@
 const { REST, Routes, SlashCommandBuilder } = require('discord.js');
-const { TOKEN, CLIENT } = require("./env");
+const { TOKEN, CLIENT, GUILDS } = require("./env");
 
+if (!TOKEN || !CLIENT) {
+    console.error('❌ TOKEN ou CLIENT ausentes no .env — abortando deploy.');
+    process.exit(1);
+}
+
+// Espelha 1:1 os comandos de texto (!play, !skip, ...) para que /slash e !
+// tenham o mesmo comportamento. Se adicionar um !comando novo, adicione o
+// /equivalente aqui e o handler em src/index.js (handleSlashCommand).
 const commands = [
-    // /play [musica]
     new SlashCommandBuilder()
         .setName('play')
-        .setDescription('Toca uma música no canal de voz')
+        .setDescription('Adiciona música à fila (YouTube)')
         .addStringOption(opt => opt.setName('musica').setDescription('Nome ou link da música').setRequired(true)),
 
-    // /playnow [musica]
+    new SlashCommandBuilder()
+        .setName('playsc')
+        .setDescription('Adiciona música à fila (SoundCloud)')
+        .addStringOption(opt => opt.setName('musica').setDescription('Nome ou link da música').setRequired(true)),
+
     new SlashCommandBuilder()
         .setName('playnow')
-        .setDescription('Fura a fila e toca uma música imediatamente')
+        .setDescription('Fura a fila: toca a música a seguir')
         .addStringOption(opt => opt.setName('musica').setDescription('Nome ou link da música').setRequired(true)),
 
-    // /stop
     new SlashCommandBuilder()
         .setName('stop')
-        .setDescription('Esvazia a fila de músicas e desconecta o bot'),
+        .setDescription('Para tudo, esvazia a fila e desconecta o bot'),
 
-    // /skip
     new SlashCommandBuilder()
         .setName('skip')
-        .setDescription('Pula a música atual'),
+        .setDescription('Pula para a próxima música'),
 
-    // /restart
     new SlashCommandBuilder()
         .setName('restart')
         .setDescription('Reinicia a música atual do começo'),
 
-    // /np
+    new SlashCommandBuilder()
+        .setName('pause')
+        .setDescription('Pausa a reprodução'),
+
+    new SlashCommandBuilder()
+        .setName('resume')
+        .setDescription('Retoma a reprodução'),
+
+    new SlashCommandBuilder()
+        .setName('autoplay')
+        .setDescription('Ativa/desativa o autoplay ao fim da fila'),
+
+    new SlashCommandBuilder()
+        .setName('loop')
+        .setDescription('Ativa/desativa a repetição da música atual'),
+
     new SlashCommandBuilder()
         .setName('np')
-        .setDescription('Mostra o painel da música que está tocando agora'),
+        .setDescription('Mostra o painel da música atual'),
 
-    // /queue
     new SlashCommandBuilder()
         .setName('queue')
-        .setDescription('Mostra a fila atual de músicas'),
+        .setDescription('Mostra as músicas na fila'),
 
-    // /history
     new SlashCommandBuilder()
-        .setName('history')
-        .setDescription('Mostra o histórico de músicas tocadas'),
+        .setName('remove')
+        .setDescription('Remove uma música da fila pelo número (veja com /queue)')
+        .addIntegerOption(opt => opt.setName('posicao').setDescription('Número da música na fila').setRequired(true).setMinValue(1)),
 
-    // /shuffle
+    new SlashCommandBuilder()
+        .setName('move')
+        .setDescription('Move uma música dentro da fila')
+        .addIntegerOption(opt => opt.setName('de').setDescription('Posição atual').setRequired(true).setMinValue(1))
+        .addIntegerOption(opt => opt.setName('para').setDescription('Nova posição').setRequired(true).setMinValue(1)),
+
+    new SlashCommandBuilder()
+        .setName('seek')
+        .setDescription('Vai para um trecho da música atual (ex: 10:20, 1:12:14, 00:15)')
+        .addStringOption(opt => opt.setName('tempo').setDescription('Posição: MM:SS, H:MM:SS ou minutos').setRequired(true)),
+
     new SlashCommandBuilder()
         .setName('shuffle')
-        .setDescription('Embaralha as músicas da fila'),
+        .setDescription('Embaralha a fila'),
 
-    // /playlist (e seus subcomandos)
+    new SlashCommandBuilder()
+        .setName('history')
+        .setDescription('Histórico de músicas tocadas neste servidor'),
+
+    new SlashCommandBuilder()
+        .setName('playlists')
+        .setDescription('Ver playlists: suas, de outro membro ou do servidor')
+        .addSubcommand(sub =>
+            sub.setName('minhas')
+                .setDescription('Lista as suas playlists')
+        )
+        .addSubcommand(sub =>
+            sub.setName('servidor')
+                .setDescription('Apanhado geral das playlists do servidor')
+        )
+        .addSubcommand(sub =>
+            sub.setName('de')
+                .setDescription('Lista as playlists de outro membro')
+                .addUserOption(opt => opt.setName('usuario').setDescription('Membro dono das playlists').setRequired(true))
+        ),
+
     new SlashCommandBuilder()
         .setName('playlist')
         .setDescription('Gerencia suas playlists personalizadas')
@@ -79,14 +131,14 @@ const commands = [
             sub.setName('remover')
                 .setDescription('Remove uma música da playlist pela posição')
                 .addStringOption(opt => opt.setName('playlist').setDescription('Nome da playlist').setRequired(true))
-                .addIntegerOption(opt => opt.setName('posicao').setDescription('Número da posição da música').setRequired(true))
+                .addIntegerOption(opt => opt.setName('posicao').setDescription('Número da posição da música').setRequired(true).setMinValue(1))
         )
         .addSubcommand(sub =>
             sub.setName('mover')
                 .setDescription('Altera a ordem de uma música na playlist')
                 .addStringOption(opt => opt.setName('playlist').setDescription('Nome da playlist').setRequired(true))
-                .addIntegerOption(opt => opt.setName('de').setDescription('Posição atual').setRequired(true))
-                .addIntegerOption(opt => opt.setName('para').setDescription('Nova posição').setRequired(true))
+                .addIntegerOption(opt => opt.setName('de').setDescription('Posição atual').setRequired(true).setMinValue(1))
+                .addIntegerOption(opt => opt.setName('para').setDescription('Nova posição').setRequired(true).setMinValue(1))
         )
         .addSubcommand(sub =>
             sub.setName('listar')
@@ -97,19 +149,30 @@ const commands = [
             sub.setName('tocar')
                 .setDescription('Adiciona todas as músicas de uma playlist à fila')
                 .addStringOption(opt => opt.setName('nome').setDescription('Nome da playlist').setRequired(true))
-        )
+                .addUserOption(opt => opt.setName('usuario').setDescription('Tocar a playlist de outro membro (opcional)').setRequired(false))
+        ),
 ].map(command => command.toJSON());
+
 const rest = new REST({ version: '10' }).setToken(TOKEN);
 
 (async () => {
     try {
-        console.log('🔄 Atualizando comandos em barra (/) na API do Discord...');
-        await rest.put(
-            Routes.applicationGuildCommands(CLIENT, "849794289805295617"),
-            { body: commands }
-        );
-        console.log('✅ Todos os comandos em barra foram registrados globalmente!');
+        // Registra por servidor (GUILDS do .env): atualiza na hora, sem esperar
+        // a propagação de até 1h dos comandos globais.
+        const guilds = [...new Set((GUILDS || []).filter(Boolean))];
+        if (guilds.length === 0) {
+            console.error('❌ GUILDS vazio no .env — nada para registrar.');
+            process.exit(1);
+        }
+        for (const guildId of guilds) {
+            console.log(`🔄 Registrando ${commands.length} comandos em ${guildId}...`);
+            await rest.put(Routes.applicationGuildCommands(CLIENT, guildId), { body: commands });
+        }
+        // Limpa comandos GLOBAIS para não duplicar (global + guild = 2 entradas).
+        await rest.put(Routes.applicationCommands(CLIENT), { body: [] });
+        console.log(`✅ ${commands.length} slash commands ativos em ${guilds.length} servidor(es).`);
     } catch (error) {
-        console.error(error);
+        console.error('❌ Erro no deploy:', error);
+        process.exit(1);
     }
 })();

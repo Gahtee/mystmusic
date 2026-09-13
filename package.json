@@ -9,7 +9,10 @@
     "smoke:offline": "SMOKE_SKIP_NETWORK=1 node test/smoke.js",
     "start": "node src/index.js",
     "deploy": "node src/config/deploy-commands.js",
-    "limpar": "node src/config/remover.js"
+    "limpar": "node src/config/remover.js",
+    "slash:limpar": "node src/config/remover.js",
+    "slash:deploy": "node src/config/deploy-commands.js",
+    "slash:reset": "node src/config/remover.js && node src/config/deploy-commands.js"
   },
   "keywords": [],
   "author": "",

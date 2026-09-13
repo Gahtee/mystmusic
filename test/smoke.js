@@ -46,6 +46,8 @@ async function main() {
         'src/music/player.js',
         'src/config/sqlite.js',
         'src/config/env.js',
+        'src/config/deploy-commands.js',
+        'src/config/remover.js',
     ];
     for (const f of arquivos) {
         await check(`node --check ${f}`, () => {
@@ -116,6 +118,34 @@ async function main() {
         const campo = painel.embeds[0].data.fields.find(f => f.name.includes('Pedido'));
         assert.ok(campo.value.includes('Autoplay'), 'autoplay não rotulado');
         assert.ok(!campo.value.includes('null'), 'vazou null no painel');
+    });
+
+    await check('slash: deploy-commands registra todos os comandos', () => {
+        const src = require('fs').readFileSync('src/config/deploy-commands.js', 'utf8');
+        // Comandos simples esperados (espelho dos !comandos)
+        for (const nome of ['play', 'playsc', 'playnow', 'stop', 'skip', 'restart',
+            'pause', 'resume', 'autoplay', 'loop', 'np', 'queue', 'remove', 'move',
+            'seek', 'shuffle', 'history', 'playlists', 'playlist']) {
+            assert.ok(src.includes(`setName('${nome}')`), `/${nome} não registrado no deploy`);
+        }
+        // Subcomandos de /playlist e /playlists
+        for (const sub of ['criar', 'excluir', 'renomear', 'add', 'remover', 'mover',
+            'listar', 'tocar', 'minhas', 'servidor']) {
+            assert.ok(src.includes(`setName('${sub}')`), `subcomando ${sub} ausente no deploy`);
+        }
+        // Opção de tocar playlist de outro membro
+        assert.ok(src.includes(`setName('usuario')`), 'opção usuario ausente em /playlist tocar');
+    });
+
+    await check('slash: handlers cobrem todos os comandos registrados', () => {
+        const src = require('fs').readFileSync('src/index.js', 'utf8');
+        for (const nome of ['play', 'playsc', 'playnow', 'stop', 'skip', 'restart',
+            'pause', 'resume', 'autoplay', 'loop', 'np', 'queue', 'remove', 'move',
+            'seek', 'shuffle', 'history', 'playlists', 'playlist']) {
+            assert.ok(src.includes(`case "${nome}"`), `/${nome} sem handler em handleSlashCommand`);
+        }
+        // Fallback para comando registrado sem handler (o bug antigo)
+        assert.ok(src.includes('sem handler'), 'fallback default ausente');
     });
 
     await check('toggleLoop/moverNaFila sem sessão', () => {
