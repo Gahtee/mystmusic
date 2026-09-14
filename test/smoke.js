@@ -193,7 +193,10 @@ async function main() {
       "src/config/deploy-commands.js",
       "utf8",
     );
-    // Comandos simples esperados (espelho dos !comandos)
+    // Comandos simples esperados (espelho dos !comandos).
+    // Aceita aspas simples ou duplas (o arquivo usa duplas).
+    const temNome = (n) =>
+      src.includes(`setName("${n}")`) || src.includes(`setName('${n}')`);
     for (const nome of [
       "play",
       "playsc",
@@ -215,10 +218,7 @@ async function main() {
       "playlists",
       "playlist",
     ]) {
-      assert.ok(
-        src.includes(`setName('${nome}')`),
-        `/${nome} não registrado no deploy`,
-      );
+      assert.ok(temNome(nome), `/${nome} não registrado no deploy`);
     }
     // Subcomandos de /playlist e /playlists
     for (const sub of [
@@ -233,16 +233,10 @@ async function main() {
       "minhas",
       "servidor",
     ]) {
-      assert.ok(
-        src.includes(`setName('${sub}')`),
-        `subcomando ${sub} ausente no deploy`,
-      );
+      assert.ok(temNome(sub), `subcomando ${sub} ausente no deploy`);
     }
     // Opção de tocar playlist de outro membro
-    assert.ok(
-      src.includes(`setName('usuario')`),
-      "opção usuario ausente em /playlist tocar",
-    );
+    assert.ok(temNome("usuario"), "opção usuario ausente em /playlist tocar");
   });
 
   await check("slash: handlers cobrem todos os comandos registrados", () => {
@@ -282,6 +276,125 @@ async function main() {
     assert.deepStrictEqual(manager.moverNaFila("guild-inexistente", 1, 2), {
       error: "fila_vazia",
     });
+  });
+
+  await check("spotify: parseSpotifyUrl cobre links, URIs e inválidos", () => {
+    const spotify = require("../src/music/spotify.js");
+    assert.deepStrictEqual(
+      spotify.parseSpotifyUrl("https://open.spotify.com/track/0VjIjW4GlUZAMYd2vXMi3b"),
+      { type: "track", id: "0VjIjW4GlUZAMYd2vXMi3b" },
+    );
+    assert.deepStrictEqual(
+      spotify.parseSpotifyUrl(
+        "https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M?si=abc123",
+      ),
+      { type: "playlist", id: "37i9dQZF1DXcBWIGoYBM5M" },
+    );
+    assert.deepStrictEqual(
+      spotify.parseSpotifyUrl("spotify:album:2ODvWsOgouMbaA5xf0RkJe"),
+      { type: "album", id: "2ODvWsOgouMbaA5xf0RkJe" },
+    );
+    assert.deepStrictEqual(
+      spotify.parseSpotifyUrl(
+        "https://open.spotify.com/intl-pt/track/0VjIjW4GlUZAMYd2vXMi3b",
+      ),
+      { type: "track", id: "0VjIjW4GlUZAMYd2vXMi3b" },
+    );
+    assert.ok(
+      spotify.isSpotifyUrl("https://open.spotify.com/track/0VjIjW4GlUZAMYd2vXMi3b"),
+    );
+    assert.strictEqual(
+      spotify.parseSpotifyUrl("https://www.youtube.com/watch?v=aqz-KE-bpKQ"),
+      null,
+    );
+    assert.strictEqual(spotify.parseSpotifyUrl("judas lady gaga"), null);
+    assert.strictEqual(spotify.isSpotifyUrl("judas lady gaga"), false);
+  });
+
+  await check("spotify: entityToResult converte track e coleção", () => {
+    const spotify = require("../src/music/spotify.js");
+    const faixa = spotify.entityToResult({
+      type: "track",
+      title: "Blinding Lights",
+      artists: [{ name: "The Weeknd" }],
+    });
+    assert.strictEqual(faixa.kind, "track");
+    assert.strictEqual(faixa.query, "Blinding Lights - The Weeknd");
+
+    const col = spotify.entityToResult({
+      type: "playlist",
+      title: "Hits",
+      trackList: [
+        { title: "Starboy", subtitle: "The Weeknd, Daft Punk" },
+        { title: "Levitating", subtitle: "Dua Lipa" },
+      ],
+    });
+    assert.strictEqual(col.kind, "collection");
+    assert.strictEqual(col.tracks.length, 2);
+    assert.strictEqual(col.tracks[0].query, "Starboy - The Weeknd, Daft Punk");
+
+    // NBSP do embed vira espaço normal
+    assert.strictEqual(spotify.cleanName("A, B"), "A, B");
+  });
+
+  await check("spotify: parseEmbedEntity rejeita página inválida", () => {
+    const spotify = require("../src/music/spotify.js");
+    assert.throws(
+      () => spotify.parseEmbedEntity("<html>sem json</html>"),
+      /Spotify/,
+    );
+  });
+
+  await check("spotify: spotifyCollectionAsPlaylist gera songs buscáveis", () => {
+    const spotify = require("../src/music/spotify.js");
+    const conv = spotify.spotifyCollectionAsPlaylist({
+      kind: "collection",
+      title: "Hits",
+      tracks: [{ title: "Starboy", artist: "The Weeknd", query: "Starboy - The Weeknd" }],
+    });
+    assert.strictEqual(conv.playlistTitle, "Spotify: Hits");
+    assert.strictEqual(conv.songs.length, 1);
+    // url null de propósito: força o play otimista a buscar no YouTube
+    // em vez de passar o link do Spotify ao yt-dlp (que falharia com DRM).
+    assert.strictEqual(conv.songs[0].url, null);
+    assert.strictEqual(conv.songs[0].query, "Starboy - The Weeknd");
+  });
+
+  await check("spotify: resolveSpotifyLink com fetch simulado", async () => {
+    const spotify = require("../src/music/spotify.js");
+    const html =
+      '<script id="__NEXT_DATA__" type="application/json">' +
+      JSON.stringify({
+        props: {
+          pageProps: {
+            state: {
+              data: {
+                entity: {
+                  type: "track",
+                  title: "Blinding Lights",
+                  artists: [{ name: "The Weeknd" }],
+                },
+              },
+            },
+          },
+        },
+      }) +
+      "</script>";
+    const fakeFetch = async () => ({ ok: true, status: 200, text: async () => html });
+    const res = await spotify.resolveSpotifyLink(
+      "https://open.spotify.com/track/0VjIjW4GlUZAMYd2vXMi3b",
+      fakeFetch,
+    );
+    assert.strictEqual(res.query, "Blinding Lights - The Weeknd");
+
+    const fake404 = async () => ({ ok: false, status: 404, text: async () => "" });
+    await assert.rejects(
+      spotify.resolveSpotifyLink(
+        "https://open.spotify.com/track/0VjIjW4GlUZAMYd2vXMi3b",
+        fake404,
+      ),
+      /não encontrado/i,
+    );
   });
 
   await check("painel clamp elapsed e flags autoplay/loop", () => {

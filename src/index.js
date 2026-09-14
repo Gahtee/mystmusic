@@ -1315,9 +1315,9 @@ client.on("messageCreate", async (message) => {
         {
           name: "▶️ Reprodução",
           value:
-            "`!play <nome/link>` — Adiciona música à fila (YouTube)\n" +
+            "`!play <nome/link>` — Adiciona música à fila (YouTube/Spotify)\n" +
             "`!playsc <nome/link ou link direto>` — SoundCloud (busca pode retornar preview de 30s em faixa de selo; prefira link direto)\n" +
-            "`!playnow <nome/link>` — Fura a fila e toca imediatamente\n" +
+            "`!playnow <nome/link>` — Fura a fila e toca imediatamente (aceita Spotify)\n" +
             "`!stop` — Para tudo e esvazia a fila\n" +
             "`!skip` — Pula para a próxima música\n" +
             "`!restart` — Reinicia a música atual do começo\n" +
@@ -1347,7 +1347,7 @@ client.on("messageCreate", async (message) => {
             '`!playlist criar "Nome"` — Cria uma playlist\n' +
             '`!playlist excluir "Nome"` — Exclui uma playlist\n' +
             '`!playlist renomear "Antigo" "Novo"` — Renomeia\n' +
-            '`!playlist add "Nome" <música>` — Adiciona faixa\n' +
+            '`!playlist add "Nome" <música>` — Adiciona faixa (aceita link do Spotify)\n' +
             '`!playlist remover "Nome" <posição>` — Remove faixa\n' +
             '`!playlist mover "Nome" <de> <para>` — Move faixa\n' +
             "`!playlist listar` — Lista suas playlists\n" +

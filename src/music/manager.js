@@ -18,6 +18,11 @@ const {
   getPlaylistMetadata,
   killStreamProcesses,
 } = require("./resolver");
+const {
+  isSpotifyUrl,
+  resolveSpotifyLink,
+  spotifyCollectionAsPlaylist,
+} = require("./spotify");
 const { logsDb, playlistDb } = require("../config/sqlite");
 const states = new Map();
 
@@ -420,12 +425,62 @@ function isPlaylistUrl(query) {
   );
 }
 
+// Coleção Spotify já convertida (play() de coleção delega para cá).
+// 1ª faixa via play() normal (cria conexão + state), resto enfileirado direto.
+// Fora do play() para não capturar o state antigo no closure.
+async function playSpotifyCollection(message, conv, searchEngine = "ytsearch") {
+  const [primeira, ...resto] = conv.songs || [];
+  if (!primeira) {
+    return message.reply("❌ Essa coleção do Spotify está vazia.");
+  }
+  await play(message, primeira.query, searchEngine);
+  const guildId = message.guild.id;
+  const state = states.get(guildId);
+  if (!state || resto.length === 0) return;
+  const espacoLivre = Math.max(0, MAX_QUEUE - state.queue.length);
+  const paraAdicionar = resto.slice(0, espacoLivre);
+  paraAdicionar.forEach((song) => {
+    song.requestedBy = message.author.id;
+    song.query = song.query || song.url;
+    song.isOpus = song.isOpus ?? null;
+    state.queue.push(song);
+  });
+  if (paraAdicionar.length > 0) {
+    message
+      .reply(
+        `✅ Mais **${paraAdicionar.length} músicas** da playlist **"${conv.playlistTitle}"** foram adicionadas à fila!`,
+      )
+      .catch(() => {});
+    prefetchProxima(state);
+  }
+}
+
 async function play(message, query, searchEngine = "ytsearch") {
   const voiceChannel = message.member.voice.channel;
   if (!voiceChannel) return message.reply("Entra num canal de voz primeiro!");
 
   const guildId = message.guild.id;
   let state = states.get(guildId);
+
+  // Link do Spotify não toca direto (DRM/sem extrator no yt-dlp): resolve para
+  // query(s) de busca no YouTube e segue o fluxo normal. Track → busca única;
+  // álbum/playlist/artista → entra no fluxo de playlist. Sem spotdl, sem
+  // credencial, sem download em disco (leve no Raspberry Pi).
+  const spotifyRef = isSpotifyUrl(query);
+  if (spotifyRef) {
+    message.reply("🔍 Lendo link do Spotify... convertendo para busca.").catch(() => {});
+    let sp;
+    try {
+      sp = await resolveSpotifyLink(query);
+    } catch (err) {
+      return message.reply(err.message || "❌ Não consegui ler esse link do Spotify.");
+    }
+    if (sp.kind === "collection") {
+      const conv = spotifyCollectionAsPlaylist(sp);
+      return playSpotifyCollection(message, conv, searchEngine);
+    }
+    query = sp.query;
+  }
 
   const isPlaylist = isPlaylistUrl(query);
   // Dispara a busca de metadados JÁ, em paralelo com a conexão de voz abaixo — as
@@ -743,6 +798,80 @@ async function play(message, query, searchEngine = "ytsearch") {
   // Anti-spam: barra novas adições quando a fila já está cheia.
   const filaCheia = () => state.queue.length >= MAX_QUEUE;
 
+  // Enfileira faixas já convertidas (playlist do YouTube OU coleção Spotify).
+  // Extraído para reuso pelo fluxo Spotify — mesma lógica, mesma UX.
+  async function enfileirarFaixas(playlistTitle, songs) {
+    if (!songs || songs.length === 0) {
+      return message.reply(
+        "❌ Não encontrei nenhuma música válida nessa playlist.",
+      );
+    }
+
+    const espacoLivre = Math.max(0, MAX_QUEUE - state.queue.length);
+    if (espacoLivre <= 0) {
+      return message.reply(
+        `❌ A fila está cheia (limite de ${MAX_QUEUE}). Use \`!skip\` ou \`!remove\` para liberar espaço.`,
+      );
+    }
+    const paraAdicionar = songs.slice(0, espacoLivre);
+
+    paraAdicionar.forEach((song) => {
+      song.requestedBy = message.author.id;
+      // Spotify chega com url null (só query de busca) — nesse caso a query
+      // É o texto "Título - Artista", não a URL. YouTube/playlists seguem com url.
+      song.query = song.query || song.url;
+      // Campos que o modo --flat-playlist não garante (ex: SoundCloud).
+      song.isOpus = song.isOpus ?? null;
+      state.queue.push(song);
+    });
+
+    const avisoLimite =
+      songs.length > paraAdicionar.length
+        ? ` (limite de ${MAX_QUEUE} — ${songs.length - paraAdicionar.length} ficaram de fora)`
+        : "";
+    message.reply(
+      `✅ **${paraAdicionar.length} músicas** da playlist **"${playlistTitle}"** foram adicionadas à fila!${avisoLimite}`,
+    );
+
+    if (state.queue.length === paraAdicionar.length) {
+      state.current = state.queue[0];
+      // Play imediato da 1ª faixa da playlist + painel provisório;
+      // metadados completam em paralelo e o painel atualiza.
+      const metaP = iniciarFaixaOtimista(
+        state,
+        state.current,
+        state.current.query,
+      );
+      await enviarNovoPainel(message.channel, state, state.current).catch(
+        () => {},
+      );
+      prefetchProxima(state);
+      try {
+        await metaP;
+      } catch (err) {
+        console.error("Falha nos metadados da playlist:", err.message);
+      }
+      await enviarNovoPainel(message.channel, state, state.current).catch(
+        () => {},
+      );
+      savePlayLog(
+        guildId,
+        message.author.id,
+        state.current.query,
+        state.current.title,
+        "SUCCESS",
+      );
+    }
+    // Pré-resolve a próxima da fila em background (transição sem espera).
+    prefetchProxima(state);
+  }
+
+  // Atalho para coleções Spotify já convertidas (mantido para compat; o
+  // entry-point real é playSpotifyCollection, fora do play()).
+  async function playSpotifyCollectionInner(conv) {
+    return enfileirarFaixas(conv.playlistTitle, conv.songs);
+  }
+
   try {
     if (isPlaylist) {
       message.reply(
@@ -750,68 +879,7 @@ async function play(message, query, searchEngine = "ytsearch") {
       );
 
       const { playlistTitle, songs } = await metadataPromise;
-
-      if (!songs || songs.length === 0) {
-        return message.reply(
-          "❌ Não encontrei nenhuma música válida nessa playlist.",
-        );
-      }
-
-      const espacoLivre = Math.max(0, MAX_QUEUE - state.queue.length);
-      if (espacoLivre <= 0) {
-        return message.reply(
-          `❌ A fila está cheia (limite de ${MAX_QUEUE}). Use \`!skip\` ou \`!remove\` para liberar espaço.`,
-        );
-      }
-      const paraAdicionar = songs.slice(0, espacoLivre);
-
-      paraAdicionar.forEach((song) => {
-        song.requestedBy = message.author.id;
-        song.query = song.url;
-        // Campos que o modo --flat-playlist não garante (ex: SoundCloud).
-        song.isOpus = song.isOpus ?? null;
-        state.queue.push(song);
-      });
-
-      const avisoLimite =
-        songs.length > paraAdicionar.length
-          ? ` (limite de ${MAX_QUEUE} — ${songs.length - paraAdicionar.length} ficaram de fora)`
-          : "";
-      message.reply(
-        `✅ **${paraAdicionar.length} músicas** da playlist **"${playlistTitle}"** foram adicionadas à fila!${avisoLimite}`,
-      );
-
-      if (state.queue.length === paraAdicionar.length) {
-        state.current = state.queue[0];
-        // Play imediato da 1ª faixa da playlist + painel provisório;
-        // metadados completam em paralelo e o painel atualiza.
-        const metaP = iniciarFaixaOtimista(
-          state,
-          state.current,
-          state.current.query,
-        );
-        await enviarNovoPainel(message.channel, state, state.current).catch(
-          () => {},
-        );
-        prefetchProxima(state);
-        try {
-          await metaP;
-        } catch (err) {
-          console.error("Falha nos metadados da playlist:", err.message);
-        }
-        await enviarNovoPainel(message.channel, state, state.current).catch(
-          () => {},
-        );
-        savePlayLog(
-          guildId,
-          message.author.id,
-          state.current.query,
-          state.current.title,
-          "SUCCESS",
-        );
-      }
-      // Pré-resolve a próxima da fila em background (transição sem espera).
-      prefetchProxima(state);
+      await enfileirarFaixas(playlistTitle, songs);
     } else {
       if (filaCheia()) {
         return message.reply(
@@ -933,6 +1001,40 @@ async function playNow(message, query) {
   }
 
   try {
+    // Spotify no fura-fila: resolve e trata como coleção ou faixa normal.
+    if (isSpotifyUrl(query)) {
+      message.reply("🔍 Lendo link do Spotify... convertendo para busca.").catch(() => {});
+      let sp;
+      try {
+        sp = await resolveSpotifyLink(query);
+      } catch (err) {
+        return message.reply(err.message || "❌ Não consegui ler esse link do Spotify.");
+      }
+      if (sp.kind === "collection") {
+        const conv = spotifyCollectionAsPlaylist(sp);
+        message.reply(
+          "🔍 Processando fura-fila de playlist... Isso pode levar alguns segundos.",
+        );
+        const paraAdicionar = conv.songs.slice(0, Math.max(0, MAX_QUEUE - state.queue.length));
+        if (paraAdicionar.length === 0) {
+          return message.reply(`❌ A fila está cheia (limite de ${MAX_QUEUE}).`);
+        }
+        paraAdicionar.reverse().forEach((song) => {
+          song.requestedBy = message.author.id;
+          song.query = song.query || song.url;
+          song.isOpus = song.isOpus ?? null;
+          if (state.queue.length <= 1) {
+            state.queue.push(song);
+          } else {
+            state.queue.splice(1, 0, song);
+          }
+        });
+        return message.reply(
+          `⚡ **Fura-Fila:** **${paraAdicionar.length} músicas** da playlist **"${conv.playlistTitle}"** foram colocadas no topo da fila!`,
+        );
+      }
+      query = sp.query;
+    }
     if (isPlaylistUrl(query)) {
       message.reply(
         "🔍 Processando fura-fila de playlist... Isso pode levar alguns segundos.",
@@ -1231,9 +1333,26 @@ function renomearPlaylist(userId, oldName, newName) {
 
 // 4. Adicionar Música na Playlist por Nome/URL
 async function adicionarFaixaPlaylist(userId, playlistName, query) {
+  // Link do Spotify: converte para "Título - Artista" e salva já resolvido no
+  // YouTube (a busca real acontece aqui, uma vez só — não a cada !playlist tocar).
+  if (isSpotifyUrl(query)) {
+    const sp = await resolveSpotifyLink(query);
+    if (sp.kind === "collection") {
+      throw new Error(
+        "❌ Esse link é uma coleção do Spotify (álbum/playlist/artista). Adicione faixas individuais ou use `!play <link>` para tocar a coleção.",
+      );
+    }
+    const track = await getAudioMetadata(sp.query);
+    query = track.url;
+    return adicionarFaixaResolvida(userId, playlistName, track);
+  }
   // Busca os metadados usando o resolvedor robusto do yt-dlp que arrumamos
   const track = await getAudioMetadata(query);
+  return adicionarFaixaResolvida(userId, playlistName, track);
+}
 
+// Insere uma faixa já resolvida (metadados prontos) na playlist do usuário.
+function adicionarFaixaResolvida(userId, playlistName, track) {
   return new Promise((resolve, reject) => {
     // Busca o ID da playlist
     playlistDb.get(
@@ -1625,6 +1744,7 @@ module.exports = {
   listarPlaylist,
   listarTodasPlaylists,
   listarPlaylistsDoServidor,
+  playSpotifyCollection,
   iniciarFaixaOtimista,
   prefetchProxima,
   garantirMetadadosCompletos,

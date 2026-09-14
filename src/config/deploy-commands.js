@@ -12,11 +12,11 @@ if (!TOKEN || !CLIENT) {
 const commands = [
   new SlashCommandBuilder()
     .setName("play")
-    .setDescription("Adiciona música à fila (YouTube)")
+    .setDescription("Adiciona música à fila (YouTube/Spotify)")
     .addStringOption((opt) =>
       opt
         .setName("musica")
-        .setDescription("Nome ou link da música")
+        .setDescription("Nome ou link da música (aceita link do Spotify)")
         .setRequired(true),
     ),
 
@@ -32,11 +32,11 @@ const commands = [
 
   new SlashCommandBuilder()
     .setName("playnow")
-    .setDescription("Fura a fila: toca a música a seguir")
+    .setDescription("Fura a fila: toca a música a seguir (aceita Spotify)")
     .addStringOption((opt) =>
       opt
         .setName("musica")
-        .setDescription("Nome ou link da música")
+        .setDescription("Nome ou link da música (aceita link do Spotify)")
         .setRequired(true),
     ),
 
