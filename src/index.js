@@ -10,7 +10,7 @@ const {
   TextInputStyle,
 } = require("discord.js");
 const { exec } = require("child_process");
-const { TOKEN, GUILDS } = require("./config/env");
+const { TOKEN, GUILDS, OWNER_IDS } = require("./config/env");
 const {
   play,
   stop,
@@ -40,8 +40,17 @@ const {
   listarPlaylist,
   listarTodasPlaylists,
   listarPlaylistsDoServidor,
+  tocarSfxEntrada,
   states,
 } = require("./music/manager");
+const {
+  parseOwnerIds,
+  isJoinNoCanalDoBot,
+  checkSfxTiming,
+  markSfxFired,
+  sortearSfxPcm,
+  preloadSfxPcm,
+} = require("./music/sfx");
 const { logsDb, playlistDb } = require("./config/sqlite");
 
 const client = new Client({
@@ -55,6 +64,11 @@ const client = new Client({
 
 client.once("clientReady", () => {
   console.log(`Bot online como ${client.user.tag}`);
+  try {
+    preloadSfxPcm();
+  } catch (err) {
+    console.error("SFX: falha no preload (sem som):", err.message);
+  }
   client.guilds.cache.forEach((guild) => {
     if (!GUILDS.includes(guild.id)) {
       console.log(`Saindo da guilda: ${guild.name}`);
@@ -1254,6 +1268,36 @@ client.on("messageCreate", async (message) => {
       );
     }
   }
+  // !sfx — testa o efeito de entrada manualmente (só dono). Toca um efeito
+  // aleatório de sounds/ por cima da música atual, igual ao join automático.
+  if (message.content.startsWith("!sfx")) {
+    const donos = parseOwnerIds(OWNER_IDS);
+    if (donos.size === 0 || !donos.has(message.author.id)) {
+      return message.reply("❌ Só o dono do bot pode usar o `!sfx`.");
+    }
+    const pick = sortearSfxPcm();
+    if (!pick) {
+      return message.reply(
+        "❌ Nenhum efeito em `sounds/` (formatos: .mp3/.ogg/.wav/.m4a/.opus, até 2MB).",
+      );
+    }
+    const res = tocarSfxEntrada(message.guild.id, pick.pcm);
+    if (res === "tocado") {
+      markSfxFired(message.guild.id);
+      return message.reply(`🔔 **${pick.nome}** por cima da música!`);
+    }
+    if (res === "tocado_solto") {
+      markSfxFired(message.guild.id);
+      return message.reply(`🔔 **${pick.nome}**!`);
+    }
+    if (res === "sem_efeitos")
+      return message.reply("❌ O bot precisa estar num canal de voz para tocar o efeito.");
+    if (res === "ja_tocando_sfx")
+      return message.reply("ℹ️ Já tem um efeito tocando agora.");
+    if (res === "pausado")
+      return message.reply("⏸️ Música pausada — retome para ouvir o efeito.");
+    return message.reply("❌ Não consegui tocar o efeito agora.");
+  }
   if (message.content.startsWith("!seek")) {
     const args = message.content.split(/\s+/);
     if (!args[1]) {
@@ -1364,6 +1408,7 @@ client.on("messageCreate", async (message) => {
         {
           name: "🔧 Outros",
           value:
+            "`!sfx` — Testa o efeito de entrada (só dono)\n" +
             "`!botmorreu` / `!botbosta` — Reinicia o bot\n" +
             "`!help` / `!comandos` — Mostra esta mensagem",
         },
@@ -1393,6 +1438,40 @@ client.on("voiceStateUpdate", async (oldState, newState) => {
   const guildId = oldState.guild.id;
   const botVoiceChannel = oldState.guild.members.me.voice.channelId;
   if (!botVoiceChannel) return;
+
+  // SFX de entrada do dono (estilo "join sound" do Nitro): dono entrou no canal
+  // onde o bot já está → remixa a música atual com efeito aleatório POR CIMA.
+  // Só JOIN real, só dono, com debounce + cooldown (ver src/music/sfx.js).
+  try {
+    if (
+      newState.member &&
+      !newState.member.user.bot &&
+      isJoinNoCanalDoBot(oldState, newState, botVoiceChannel)
+    ) {
+      const donos = parseOwnerIds(OWNER_IDS);
+      if (donos.size > 0 && donos.has(newState.member.id)) {
+        const timing = checkSfxTiming(guildId);
+        if (timing === "ok") {
+          const pick = sortearSfxPcm();
+          if (pick) {
+            const res = tocarSfxEntrada(guildId, pick.pcm);
+            if (res === "tocado" || res === "tocado_solto") {
+              markSfxFired(guildId);
+              console.log(
+                `🔔 SFX de entrada para ${newState.member.user.username} (${guildId}): ${pick.nome} (${res})`,
+              );
+            } else {
+              console.log(`🔕 SFX ignorado (${res}) no servidor ${guildId}.`);
+            }
+          }
+        }
+      }
+    }
+  } catch (err) {
+    // SFX nunca pode derrubar o handler principal (desconexão por inatividade).
+    console.error("Erro no SFX de entrada:", err.message);
+  }
+
   if (
     oldState.channelId === botVoiceChannel &&
     newState.channelId !== botVoiceChannel

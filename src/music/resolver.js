@@ -276,7 +276,7 @@ async function getPlaylistMetadata(playlistUrl) {
       };
     })
     // Remove placeholders de vídeos indisponíveis (privado/deletado) que
-    // quebrariam o getAudioStream depois.
+    // quebrariam o stream depois.
     .filter((s) => typeof s.url === "string" && s.url.length > 0);
 
   return {
@@ -292,7 +292,18 @@ function attachProcesses(stream, processes) {
   return stream;
 }
 
-function getAudioStream(url, seekSec = 0) {
+// Pipeline: yt-dlp (musica) -> ffmpeg decode
+// para PCM. O PcmMixer do state consome este PCM e o encoder Opus do
+// @discordjs/voice (StreamType.Raw) codifica para o Discord.
+// Sem amix/sem SFX aqui: o overlay entra no mixer via playOverlay (memoria).
+// Custo: 1 ffmpeg de decode (_, yt-dlp->PCM, sem seek pos-input) + encode Opus
+// via opusscript (~10x realtime no Pi). Sem seek/rede/resume: o mixer NUNCA para.
+// Variante com seek para o pipeline PCM: yt-dlp baixa do zero (sem seek de
+// rede — evita os 10-14s de latencia do --download-sections com pipe) e o
+// -ss POS-input descarta o prefixo ja em PCM local (barato, sem rede).
+// Seguro aqui porque o SFX NAO passa por este ffmpeg: entra no PcmMixer via
+// memoria (playOverlay), imune ao bug antigo do -ss pos-input no amix.
+function getPcmStreamWithSeek(url, seekSec = 0) {
   const baseArgs = [
     ...cookieArgs(),
     "-f",
@@ -305,69 +316,125 @@ function getAudioStream(url, seekSec = 0) {
     "--quiet",
     "--no-warnings",
   ];
-
-  // Quando há seek, adicionamos -ss via ffmpeg (mais confiável que --download-sections
-  // para streams ao vivo e formatos não-WebM). O yt-dlp emite o áudio bruto e o
-  // ffmpeg corta e re-codifica para Opus/ogg que o Discord entende sem problemas.
-  if (seekSec > 0) {
-    const ytProcess = spawn("yt-dlp", [...baseArgs, url]);
-    ytProcess.stderr.on("data", (d) =>
-      console.error(`[yt-dlp seek error]: ${d}`),
-    );
-    ytProcess.on("error", (err) =>
-      console.error("[SPAWN ERROR yt-dlp seek]:", err),
-    );
-
-    // ffmpeg lê stdin (yt-dlp), pula seekSec segundos e emite Opus em ogg
-    const ffArgs = [
-      "-i",
-      "pipe:0",
-      "-ss",
-      String(seekSec),
-      "-acodec",
-      "libopus",
-      "-f",
-      "opus",
-      "-vn",
-      "pipe:1",
-    ];
-    const ffProcess = spawn("ffmpeg", ffArgs, {
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-    ffProcess.stderr.on("data", (d) => {
-      const msg = d.toString();
-      // Ignora linhas de progresso normais do ffmpeg
-      if (!msg.includes("frame=") && !msg.includes("size=")) {
-        console.error(`[ffmpeg seek error]: ${msg}`);
-      }
-    });
-    ffProcess.on("error", (err) =>
-      console.error("[SPAWN ERROR ffmpeg seek]:", err),
-    );
-
-    ytProcess.stdout.pipe(ffProcess.stdin);
-    ytProcess.stdout.on("error", () => ffProcess.stdin.destroy());
-    ffProcess.stdin.on("error", () => {}); // evita crash por broken pipe
-
-    // Se o ffmpeg morre, não deixa o yt-dlp órfão bombeando bytes.
-    ffProcess.on("close", () => {
-      if (!ytProcess.killed) ytProcess.kill("SIGKILL");
-    });
-
-    return attachProcesses(ffProcess.stdout, [ytProcess, ffProcess]);
-  }
-
   const ytProcess = spawn("yt-dlp", [...baseArgs, url]);
+  ytProcess.stderr.on("data", (d) =>
+    console.error(`[yt-dlp pcm error]: ${d}`),
+  );
+  ytProcess.on("error", (err) =>
+    console.error("[SPAWN ERROR yt-dlp pcm]:", err),
+  );
 
-  ytProcess.stderr.on("data", (data) => {
-    console.error(`[yt-dlp error]: ${data}`);
+  const ss = Math.max(0, Math.floor(seekSec || 0));
+  const ffArgs = [
+    "-i",
+    "pipe:0",
+    ...(ss > 0 ? ["-ss", String(ss)] : []),
+    "-f",
+    "s16le",
+    "-ar",
+    "48000",
+    "-ac",
+    "2",
+    "-vn",
+    "pipe:1",
+  ];
+  const ffProcess = spawn("ffmpeg", ffArgs, {
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  ffProcess.stderr.on("data", (d) => {
+    const msg = d.toString();
+    if (!msg.includes("frame=") && !msg.includes("size=")) {
+      console.error(`[ffmpeg pcm error]: ${msg}`);
+    }
+  });
+  ffProcess.on("error", (err) =>
+    console.error("[SPAWN ERROR ffmpeg pcm]:", err),
+  );
+
+  try {
+    ytProcess.stdout.pipe(ffProcess.stdin);
+  } catch (err) {
+    // stdin pode ja estar fechado — ignora.
+  }
+  ytProcess.stdout.on("error", () => {
+    try {
+      ffProcess.stdin.destroy();
+    } catch (err) {
+      // Ja fechado — nada a fazer.
+    }
+  });
+  ffProcess.stdin.on("error", () => {}); // evita crash por broken pipe
+  ffProcess.on("close", () => {
+    if (!ytProcess.killed) ytProcess.kill("SIGKILL");
   });
 
-  ytProcess.on("error", (err) => {
-    console.error("[SPAWN ERROR]: Falha ao iniciar o yt-dlp:", err);
+  return attachProcesses(ffProcess.stdout, [ytProcess, ffProcess]);
+}
+
+function getPcmStream(url) {
+  const baseArgs = [
+    ...cookieArgs(),
+    "-f",
+    "bestaudio[acodec=opus]/bestaudio/best",
+    "--js-runtimes",
+    "node",
+    "-o",
+    "-",
+    "--no-playlist",
+    "--quiet",
+    "--no-warnings",
+  ];
+  const ytProcess = spawn("yt-dlp", [...baseArgs, url]);
+  ytProcess.stderr.on("data", (d) =>
+    console.error(`[yt-dlp pcm error]: ${d}`),
+  );
+  ytProcess.on("error", (err) =>
+    console.error("[SPAWN ERROR yt-dlp pcm]:", err),
+  );
+
+  const ffArgs = [
+    "-i",
+    "pipe:0",
+    "-f",
+    "s16le",
+    "-ar",
+    "48000",
+    "-ac",
+    "2",
+    "-vn",
+    "pipe:1",
+  ];
+  const ffProcess = spawn("ffmpeg", ffArgs, {
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  ffProcess.stderr.on("data", (d) => {
+    const msg = d.toString();
+    if (!msg.includes("frame=") && !msg.includes("size=")) {
+      console.error(`[ffmpeg pcm error]: ${msg}`);
+    }
+  });
+  ffProcess.on("error", (err) =>
+    console.error("[SPAWN ERROR ffmpeg pcm]:", err),
+  );
+
+  try {
+    ytProcess.stdout.pipe(ffProcess.stdin);
+  } catch (err) {
+    // stdin pode ja estar fechado — ignora.
+  }
+  ytProcess.stdout.on("error", () => {
+    try {
+      ffProcess.stdin.destroy();
+    } catch (err) {
+      // Ja fechado — nada a fazer.
+    }
+  });
+  ffProcess.stdin.on("error", () => {}); // evita crash por broken pipe
+  ffProcess.on("close", () => {
+    if (!ytProcess.killed) ytProcess.kill("SIGKILL");
   });
 
-  return attachProcesses(ytProcess.stdout, [ytProcess]);
+  return attachProcesses(ffProcess.stdout, [ytProcess, ffProcess]);
 }
 
 // Mata os processos de stream anteriores. Chamado antes de cada nova reprodução,
@@ -387,7 +454,8 @@ function killStreamProcesses(stream) {
 
 module.exports = {
   getAudioMetadata,
-  getAudioStream,
+  getPcmStream,
+  getPcmStreamWithSeek,
   getPlaylistMetadata,
   killStreamProcesses,
   normalizeMetadata,

@@ -6,7 +6,7 @@
 //      isPlaylistUrl, removeFromQueue, shuffleQueue, extrairYoutubeId,
 //      MAX_QUEUE, exports do manager/resolver
 //   3. Integração real (yt-dlp + ffmpeg instalados): getAudioMetadata,
-//      getAudioStream (sem seek e com seek), getPlaylistMetadata, killStreamProcesses
+//      getPcmStream (PCM s16le 48k), getPlaylistMetadata, killStreamProcesses
 // Cobre as áreas alteradas na refatoração P0/P1/P2. Não precisa de token do Discord.
 // Integração pode ser pulada com: SMOKE_SKIP_NETWORK=1 npm run smoke
 
@@ -52,6 +52,8 @@ async function main() {
     "src/music/manager.js",
     "src/music/resolver.js",
     "src/music/player.js",
+    "src/music/pcmMixer.js",
+    "src/music/sfx.js",
     "src/config/sqlite.js",
     "src/config/env.js",
     "src/config/deploy-commands.js",
@@ -397,6 +399,229 @@ async function main() {
     );
   });
 
+  await check("sfx: parseOwnerIds filtra IDs inválidos", () => {
+    const sfx = require("../src/music/sfx.js");
+    assert.deepStrictEqual(
+      [...sfx.parseOwnerIds("123456789012345678, 987654321098765432")],
+      ["123456789012345678", "987654321098765432"],
+    );
+    // Rejeita: nome de usuário do SO ("gahtee"), vazio, curto, com letras
+    assert.strictEqual(sfx.parseOwnerIds("gahtee").size, 0);
+    assert.strictEqual(sfx.parseOwnerIds("").size, 0);
+    assert.strictEqual(sfx.parseOwnerIds(undefined).size, 0);
+    assert.strictEqual(sfx.parseOwnerIds("abc123").size, 0);
+    assert.strictEqual(sfx.parseOwnerIds("123").size, 0);
+  });
+
+  await check("sfx: isJoinNoCanalDoBot só aceita join real", () => {
+    const sfx = require("../src/music/sfx.js");
+    const join = (o, n) => sfx.isJoinNoCanalDoBot({ channelId: o }, { channelId: n }, "BOT");
+    assert.strictEqual(join(null, "BOT"), true); // entrou do nada
+    assert.strictEqual(join("OUTRO", "BOT"), true); // trocou p/ o do bot
+    assert.strictEqual(join("BOT", "BOT"), false); // mute/deafen (já estava)
+    assert.strictEqual(join("BOT", "OUTRO"), false); // saiu
+    assert.strictEqual(join("BOT", null), false); // desconectou
+    assert.strictEqual(join(null, "OUTRO"), false); // entrou em outro canal
+    assert.strictEqual(
+      sfx.isJoinNoCanalDoBot({ channelId: null }, { channelId: "BOT" }, null),
+      false, // bot fora de canal — sem SFX
+    );
+  });
+
+  await check("sfx: checkSfxTiming debounce + cooldown", () => {
+    const sfx = require("../src/music/sfx.js");
+    sfx._lastSfxAt.clear();
+    assert.strictEqual(sfx.checkSfxTiming("g1", 100000), "ok");
+    sfx.markSfxFired("g1", 100000);
+    assert.strictEqual(sfx.checkSfxTiming("g1", 101000), "debounce"); // +1s
+    assert.strictEqual(sfx.checkSfxTiming("g1", 110000), "cooldown"); // +10s
+    assert.strictEqual(sfx.checkSfxTiming("g1", 131000), "ok"); // +31s
+    assert.strictEqual(sfx.checkSfxTiming("g2", 101000), "ok"); // outra guild
+    sfx._lastSfxAt.clear();
+  });
+
+  await check("sfx: listarEfeitos filtra extensão e tamanho", () => {
+    const sfx = require("../src/music/sfx.js");
+    const fs = require("fs");
+    const os = require("os");
+    const dir = fs.mkdtempSync(`${os.tmpdir()}/sfx-test-`);
+    fs.writeFileSync(`${dir}/a.mp3`, "x");
+    fs.writeFileSync(`${dir}/b.ogg`, "x");
+    fs.writeFileSync(`${dir}/c.txt`, "x"); // extensão inválida
+    fs.writeFileSync(`${dir}/D.MP3`, "x"); // maiúscula vale
+    const grande = Buffer.alloc(3 * 1024 * 1024);
+    fs.writeFileSync(`${dir}/grande.mp3`, grande); // >2MB fora
+    assert.deepStrictEqual(sfx.listarEfeitos(dir), ["D.MP3", "a.mp3", "b.ogg"]);
+    assert.deepStrictEqual(sfx.listarEfeitos(`${dir}/inexistente`), []);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  await check("sfx: sortearEfeito usa rand injetado", () => {
+    const sfx = require("../src/music/sfx.js");
+    assert.strictEqual(sfx.sortearEfeito([]), null);
+    assert.strictEqual(sfx.sortearEfeito(null), null);
+    const arq = sfx.sortearEfeito(["x", "y", "z"], () => 0.99);
+    assert.ok(arq.endsWith("z"), `sorteio errado: ${arq}`);
+    const arq0 = sfx.sortearEfeito(["x", "y"], () => 0.0);
+    assert.ok(arq0.endsWith("x"), `sorteio errado: ${arq0}`);
+  });
+
+  await check("sfx: sounds/entrada.mp3 existe e é curta", () => {
+    const fs = require("fs");
+    const st = fs.statSync("sounds/entrada.mp3");
+    assert.ok(st.size > 1000 && st.size <= 2 * 1024 * 1024, `tamanho: ${st.size}`);
+    const sfx = require("../src/music/sfx.js");
+    assert.ok(sfx.listarEfeitos().includes("entrada.mp3"), "chime fora da lista");
+  });
+
+  await check("sfx: tocarSfxEntrada sem musica toca solto (sem state)", () => {
+    // Sem state e sem conexao de voz -> sem_efeitos (bot fora do canal)
+    assert.strictEqual(manager.tocarSfxEntrada("guild-inexistente", Buffer.alloc(4)), "sem_efeitos");
+    assert.strictEqual(manager.tocarSfxEntrada("guild-inexistente", null), "sem_efeitos");
+    assert.strictEqual(manager.tocarSfxEntrada("guild-inexistente", "/x.mp3"), "sem_efeitos");
+  });
+
+  await check("sfx: playStandalone gera PCM e emite overlay-done", async () => {
+    const { PcmMixer } = require("../src/music/pcmMixer.js");
+    const sfx = require("../src/music/sfx.js");
+    sfx._pcmCache.clear();
+    assert.ok(sfx.preloadSfxPcm() >= 1);
+    const { pcm } = sfx.sortearSfxPcm(() => 0);
+    const mixer = new PcmMixer();
+    const bufs = [];
+    mixer.on("data", (d) => bufs.push(d));
+    const doneP = new Promise((resolve) => mixer.once("overlay-done", resolve));
+    assert.strictEqual(mixer.playStandalone(pcm, { delayMs: 100 }), true);
+    assert.strictEqual(mixer.playStandalone(pcm, { delayMs: 0 }), false, "duplo standalone deveria recusar");
+    await doneP;
+    const out = Buffer.concat(bufs);
+    assert.ok(out.length >= pcm.length, "PCM standalone curto demais");
+    let energia = 0;
+    for (let i = 0; i < out.length; i += 2) energia += Math.abs(out.readInt16LE(i));
+    assert.ok(energia > 0, "standalone zerado (SFX ausente)");
+    // pre-delay (primeiros 50ms) deve ser silencio
+    let pre = 0;
+    for (let i = 0; i < Math.min(out.length, 9600); i += 2) pre += Math.abs(out.readInt16LE(i));
+    assert.strictEqual(pre, 0, "pre-delay deveria ser silencio");
+  });
+
+  await check("sfx: tocarSfxEntrada injeta overlay no mixer (sem restart)", () => {
+    const { PcmMixer } = require("../src/music/pcmMixer.js");
+    const gid = "guild-sfx-mixer";
+    const mixer = new PcmMixer();
+    manager.states.set(gid, {
+      current: { title: "a", url: "https://x" },
+      pcmMixer: mixer,
+      player: { state: { status: "playing" } },
+    });
+    const pcm = Buffer.alloc(16);
+    for (let i = 0; i < 8; i++) pcm.writeInt16LE(1000, i * 2);
+    assert.strictEqual(manager.tocarSfxEntrada(gid, pcm), "tocado");
+    assert.strictEqual(manager.tocarSfxEntrada(gid, pcm), "ja_tocando_sfx");
+    assert.strictEqual(mixer.pending, 1, "overlay nao enfileirado no mixer");
+    assert.ok(mixer.playing, "mixer deveria estar playing");
+    // pausado recusa
+    const gid2 = "guild-sfx-paused";
+    const mixer2 = new PcmMixer();
+    manager.states.set(gid2, {
+      current: { title: "a", url: "https://x" },
+      pcmMixer: mixer2,
+      pausedAt: Date.now(),
+      player: { state: { status: "paused" } },
+    });
+    assert.strictEqual(manager.tocarSfxEntrada(gid2, pcm), "pausado");
+    manager.states.delete(gid);
+    manager.states.delete(gid2);
+  });
+
+  await check("sfx: getPcmStream exportado + index integra", () => {
+    const resolver = require("../src/music/resolver.js");
+    const fs = require("fs");
+    assert.strictEqual(typeof resolver.getPcmStream, "function");
+    assert.strictEqual(typeof resolver.getPcmStreamWithSeek, "function");
+    assert.strictEqual(resolver.getMixedStream, undefined, "getMixedStream deveria ter saido");
+    assert.strictEqual(manager.estimarDuracaoSfxMs, undefined, "estimarDuracaoSfxMs deveria ter saido");
+    const idx = fs.readFileSync("src/index.js", "utf8");
+    assert.ok(idx.includes("tocarSfxEntrada"), "!sfx/handler ausente no index");
+    assert.ok(idx.includes("isJoinNoCanalDoBot"), "detecção de join ausente");
+    assert.ok(idx.includes("OWNER_IDS"), "OWNER_IDS ausente no index");
+    assert.ok(idx.includes("preloadSfxPcm"), "preload no boot ausente");
+    assert.ok(idx.includes("sortearSfxPcm"), "trigger PCM ausente");
+    const env = fs.readFileSync("src/config/env.js", "utf8");
+    assert.ok(env.includes("OWNER_IDS"), "OWNER_IDS ausente no env.js");
+  });
+
+  await check("sfx: preload PCM + PcmMixer math", () => {
+    const sfx = require("../src/music/sfx.js");
+    sfx._pcmCache.clear();
+    const n = sfx.preloadSfxPcm();
+    assert.ok(n >= 1, "nenhum efeito pre-carregado");
+    const pcm = sfx.getSfxPcm("entrada.mp3");
+    assert.ok(Buffer.isBuffer(pcm) && pcm.length > 1000, "PCM invalido");
+    assert.strictEqual(sfx.getSfxPcm("inexistente.mp3"), null);
+    const pick = sfx.sortearSfxPcm(() => 0);
+    assert.ok(pick && Buffer.isBuffer(pick.pcm) && pick.pcm.length > 1000, "sorteio PCM invalido");
+    assert.strictEqual(pick.pcm, sfx.getSfxPcm(pick.nome), "sorteio deveria devolver o buffer do cache");
+    // failsafe: entrada.mp3 fora do sorteio normal, usado so quando nao ha outro
+    assert.strictEqual(sfx.SFX_FALLBACK, "entrada.mp3");
+    assert.ok(pick.nome !== "entrada.mp3" || pick.fallback === true, "failsafe no sorteio normal");
+    sfx._pcmCache.clear();
+    sfx._pcmCache.set("entrada.mp3", Buffer.alloc(4));
+    const fb = sfx.sortearSfxPcm(() => 0.5);
+    assert.strictEqual(fb.nome, "entrada.mp3");
+    assert.strictEqual(fb.fallback, true, "failsafe deveria vir com flag");
+    sfx._pcmCache.clear();
+    sfx._pcmCache.set("x.mp3", Buffer.alloc(4));
+    sfx._pcmCache.set("entrada.mp3", Buffer.alloc(4));
+    for (let i = 0; i < 10; i++) {
+      const q = sfx.sortearSfxPcm(() => i / 10);
+      assert.strictEqual(q.nome, "x.mp3", "sorteio pegou o failsafe com efeitos disponiveis");
+      assert.strictEqual(q.fallback, false);
+    }
+    sfx._pcmCache.clear();
+    assert.strictEqual(sfx.sortearSfxPcm(), null, "cache vazio deveria dar null");
+
+    // mixer: passthrough bit-identico + overlay com duck + clipping
+    const { PcmMixer, clamp16 } = require("../src/music/pcmMixer.js");
+    assert.strictEqual(clamp16(99999), 32767);
+    assert.strictEqual(clamp16(-99999), -32768);
+    const mx = new PcmMixer({ duckGain: 0.6, sfxGain: 1.0 });
+    const mus = Buffer.alloc(16);
+    for (let i = 0; i < 8; i++) mus.writeInt16LE(1000, i * 2);
+    const ef = Buffer.alloc(8);
+    for (let i = 0; i < 4; i++) ef.writeInt16LE(1000, i * 2);
+    const chunks = [];
+    mx.on("data", (d) => chunks.push(d));
+    mx.playOverlay(ef, { delayMs: 0 });
+    mx.write(mus);
+    mx.end(() => {});
+    const out = Buffer.concat(chunks);
+    const vals = [];
+    for (let i = 0; i < 8; i++) vals.push(out.readInt16LE(i * 2));
+    assert.deepStrictEqual(vals.slice(0, 4), [1600, 1600, 1600, 1600]);
+    assert.deepStrictEqual(vals.slice(4), [1000, 1000, 1000, 1000]);
+  });
+
+  await check("sfx: skip limpa overlay do mixer (sem vazar p/ proxima faixa)", () => {
+    const { PcmMixer } = require("../src/music/pcmMixer.js");
+    const gid = "guild-sfx-timer";
+    const mixer = new PcmMixer();
+    mixer.playOverlay(Buffer.alloc(16, 1), { delayMs: 0 });
+    assert.strictEqual(mixer.pending, 1);
+    manager.states.set(gid, {
+      pcmMixer: mixer,
+      queue: [{ title: "a" }, { title: "b" }],
+      current: { title: "a" },
+      player: { stop: () => {} },
+      connection: { state: { status: "ready" }, destroy: () => {} },
+    });
+    assert.strictEqual(manager.skip(gid), true);
+    assert.strictEqual(mixer.pending, 0, "skip não limpou overlay do mixer");
+    assert.strictEqual(mixer.playing, false);
+    manager.states.delete(gid);
+    assert.strictEqual(typeof manager.limparTimerSfx, "function");
+  });
+
   await check("painel clamp elapsed e flags autoplay/loop", () => {
     // Elapsed maior que a duração (drift do relógio) — não pode mostrar 4:10 / 4:05.
     const painel = manager.criarPainelMusical(
@@ -526,35 +751,10 @@ async function main() {
     });
 
     await check(
-      "getAudioStream sem seek emite bytes e morre no kill",
+      "getPcmStream emite PCM s16le 48k stereo e morre no kill",
       async () => {
-        const stream = resolver.getAudioStream(TEST_URL);
+        const stream = resolver.getPcmStream(TEST_URL);
         assert.ok(stream && typeof stream.on === "function", "stream inválido");
-        const gotBytes = await new Promise((resolve) => {
-          const t = setTimeout(() => resolve(false), 15000);
-          stream.once("data", () => {
-            clearTimeout(t);
-            resolve(true);
-          });
-          stream.once("error", () => {
-            clearTimeout(t);
-            resolve(false);
-          });
-        });
-        resolver.killStreamProcesses(stream);
-        await new Promise((r) => setTimeout(r, 500));
-        const mortos = (stream._childProcesses || []).every(
-          (p) => p.killed || p.exitCode !== null,
-        );
-        assert.ok(gotBytes, "yt-dlp não emitiu bytes em 15s");
-        assert.ok(mortos, "processos órfãos após kill");
-      },
-    );
-
-    await check(
-      "getAudioStream com seek (ffmpeg) emite bytes Opus",
-      async () => {
-        const stream = resolver.getAudioStream(TEST_URL, 5);
         const gotBytes = await new Promise((resolve) => {
           const t = setTimeout(() => resolve(false), 20000);
           stream.once("data", () => {
@@ -566,8 +766,33 @@ async function main() {
             resolve(false);
           });
         });
+        // Valida formato: acumula 192000 bytes (=1s) e checa nível (não-silêncio)
+        const buf = await new Promise((resolve) => {
+          const chunks = [];
+          let total = 0;
+          const t = setTimeout(() => resolve(Buffer.concat(chunks)), 20000);
+          stream.on("data", (d) => {
+            chunks.push(d);
+            total += d.length;
+            if (total >= 192000) {
+              clearTimeout(t);
+              resolve(Buffer.concat(chunks));
+            }
+          });
+        });
         resolver.killStreamProcesses(stream);
-        assert.ok(gotBytes, "pipeline yt-dlp+ffmpeg não emitiu bytes em 20s");
+        await new Promise((r) => setTimeout(r, 500));
+        const mortos = (stream._childProcesses || []).every(
+          (p) => p.killed || p.exitCode !== null,
+        );
+        assert.ok(gotBytes, "yt-dlp+ffmpeg PCM não emitiu bytes em 20s");
+        assert.ok(buf.length >= 8192, "PCM curto demais");
+        assert.strictEqual(buf.length % 2, 0, "PCM com byte ímpar (s16le quebrado)");
+        // Energia: soma abs das amostras — silêncio total indica decode falho
+        let energia = 0;
+        for (let i = 0; i < buf.length; i += 2) energia += Math.abs(buf.readInt16LE(i));
+        assert.ok(energia > 0, "PCM zerado (decode falho)");
+        assert.ok(mortos, "processos órfãos após kill");
       },
     );
 
