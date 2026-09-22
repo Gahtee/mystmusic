@@ -69,13 +69,144 @@ function criarBarraProgresso(elapsedSec, totalSec, tamanho = 20) {
 }
 
 // Quanto tempo (ms) já tocou da faixa atual, descontando o tempo pausado.
+// Com nightcore, o áudio anda rate x mais rápido: escala pelo playbackRate
+// do mixer para a barra/painel refletirem a posição AUDÍVEL (não o wall-clock).
 function calcularElapsedMs(state) {
   if (!state.playbackStartedAt) return 0;
   const agora = state.pausedAt || Date.now();
-  return Math.max(
+  const wall = Math.max(
     0,
     agora - state.playbackStartedAt - (state.totalPausedMs || 0),
   );
+  const rate =
+    (state.pcmMixer && state.pcmMixer.playbackRate) || 1;
+  return wall * rate;
+}
+
+// Config de FX de áudio por servidor (persiste entre faixas; reset no stop).
+// bassDb: 0 = off; nightcore: 1 = off. Valores padrão quando ligado sem arg.
+function getAudioFx(state) {
+  if (!state.audioFx) state.audioFx = { bassDb: 0, nightcore: 1 };
+  return state.audioFx;
+}
+
+// Aplica a config do state no mixer atual (chamado a cada faixa nova, pois o
+// mixer é recriado por faixa mas a config é da sessão).
+function aplicarFxNoMixer(state) {
+  if (!state || !state.pcmMixer) return;
+  const fx = getAudioFx(state);
+  try {
+    state.pcmMixer.setBass(fx.bassDb);
+  } catch (err) {
+    // Best-effort.
+  }
+  try {
+    state.pcmMixer.setNightcore(fx.nightcore);
+  } catch (err) {
+    // Best-effort.
+  }
+}
+
+// Duração EFETIVA da faixa com nightcore (a faixa acaba rate x mais cedo).
+// Usada no painel/seek para não mostrar "4:10 / 4:05" nem aceitar seek além.
+function duracaoEfetiva(song, state) {
+  if (!song || !song.duration) return song ? song.duration : null;
+  const rate = (state && state.pcmMixer && state.pcmMixer.playbackRate) || 1;
+  return song.duration / rate;
+}
+
+// Bass boost configurável (dB, sem limite). Sem arg (ou "off"/0) = desliga;
+// com arg = define (ex: !bass 8). Retorna { db } ou { error }.
+// Toggle instantâneo: aplica no mixer atual sem restart (afeta a faixa no ar).
+function setBassBoost(guildId, raw) {
+  const state = states.get(guildId);
+  if (!state) return { error: "sem_sessao" };
+  const { parseFxAmount, DEFAULT_BASS_DB } = require("./pcmMixer");
+  if (raw === undefined || raw === null || raw === "") {
+    // Toggle: off -> padrão, on -> off.
+    const fx = getAudioFx(state);
+    const novoDb = fx.bassDb > 0 ? 0 : DEFAULT_BASS_DB;
+    fx.bassDb = novoDb;
+    if (state.pcmMixer) state.pcmMixer.setBass(novoDb);
+    return { db: novoDb, toggled: true };
+  }
+  const s = String(raw).trim().toLowerCase();
+  if (s === "off" || s === "desligar" || s === "desativar") {
+    getAudioFx(state).bassDb = 0;
+    if (state.pcmMixer) state.pcmMixer.setBass(0);
+    return { db: 0 };
+  }
+  const db = parseFxAmount(s, { min: 0, max: null });
+  if (db === null) return { error: "invalido" };
+  getAudioFx(state).bassDb = db;
+  if (state.pcmMixer) state.pcmMixer.setBass(db);
+  return { db };
+}
+
+// Nightcore configurável (rate, ex: 1.25). Sem arg = toggle (off -> 1.25x,
+// on -> off); com arg = define (0.5..3). Retorna { rate } ou { error }.
+// Toggle instantâneo no áudio; o relógio/barra escalam via playbackRate.
+// Efeito colateral honesto: a faixa acaba rate x mais cedo (duração efetiva).
+function setNightcore(guildId, raw) {
+  const state = states.get(guildId);
+  if (!state) return { error: "sem_sessao" };
+  const {
+    parseFxAmount,
+    DEFAULT_NIGHTCORE_RATE,
+    MIN_NIGHTCORE_RATE,
+    MAX_NIGHTCORE_RATE,
+  } = require("./pcmMixer");
+  if (raw === undefined || raw === null || raw === "") {
+    const fx = getAudioFx(state);
+    const antiga = fx.nightcore;
+    const novo = antiga !== 1 ? 1 : DEFAULT_NIGHTCORE_RATE;
+    // Ordem: fx (taxa nova p/ o rebalance ler) -> rebalance (mixer ainda na
+    // antiga, entao wall * antiga == posicao real) -> troca o mixer.
+    fx.nightcore = novo;
+    rebalancearRelogio(state, antiga);
+    if (state.pcmMixer) state.pcmMixer.setNightcore(novo);
+    return { rate: novo, toggled: true };
+  }
+  const s = String(raw).trim().toLowerCase();
+  if (s === "off" || s === "desligar" || s === "desativar") {
+    const antiga = getAudioFx(state).nightcore;
+    getAudioFx(state).nightcore = 1;
+    rebalancearRelogio(state, antiga);
+    if (state.pcmMixer) state.pcmMixer.setNightcore(1);
+    return { rate: 1 };
+  }
+  const rate = parseFxAmount(s, {
+    min: MIN_NIGHTCORE_RATE,
+    max: MAX_NIGHTCORE_RATE,
+  });
+  if (rate === null) return { error: "invalido" };
+  const antiga = getAudioFx(state).nightcore;
+  getAudioFx(state).nightcore = rate;
+  rebalancearRelogio(state, antiga);
+  if (state.pcmMixer) state.pcmMixer.setNightcore(rate);
+  return { rate };
+}
+
+// Rebasa playbackStartedAt para que calcularElapsedMs() (ja escalado pela
+// taxa NOVA) continue retornando a mesma posicao audivel de antes da troca.
+// Sem isso, ligar 1.25x no meio da faixa faria a barra saltar de uma vez.
+// DEVE ser chamado ANTES de trocar o mixer: usa a taxa atual do mixer
+// (ainda antiga) para medir a posicao real, e reancora o marco de modo que
+// wallNovo * taxaNova == posicao. taxaNova vai embutida via fx do state
+// (ja atualizado pelo chamador) — por isso a ordem importa: rebalancear,
+// depois setNightcore no mixer.
+function rebalancearRelogio(state, taxaAntiga) {
+  if (!state || !state.playbackStartedAt) return;
+  const agora = state.pausedAt || Date.now();
+  const wall = Math.max(
+    0,
+    agora - state.playbackStartedAt - (state.totalPausedMs || 0),
+  );
+  const antiga = taxaAntiga && taxaAntiga > 0 ? taxaAntiga : 1;
+  const nova = (getAudioFx(state) || {}).nightcore || 1;
+  const posicaoAudivel = wall * antiga;
+  state.playbackStartedAt =
+    agora - (state.totalPausedMs || 0) - posicaoAudivel / nova;
 }
 
 // Extrai o ID de 11 caracteres de uma URL do YouTube (watch?v= ou youtu.be/), usado
@@ -90,14 +221,16 @@ function criarPainelMusical(metadata, elapsedSec = 0, flags = {}) {
   const titulo = metadata.title || "🔍 Buscando dados da faixa...";
   const url = metadata.url || null;
   const descricaoTitulo = url ? `**[${titulo}](${url})**` : `**${titulo}**`;
+  // Com nightcore a faixa acaba rate x mais cedo: a barra usa a duração
+  // EFETIVA (flags.duracaoEfetiva, calculada pelo chamador com o state).
+  // Fallback p/ duration crua quando o chamador não informa (testes, np sem state).
+  const durTotal = flags.duracaoEfetiva || metadata.duration;
   // Clamp: o relógio é Date.now() e o Discord atrasa/adianta o áudio real —
   // sem isso o painel mostra "4:10 / 4:05".
   const elapsedSafe = Math.max(0, Math.floor(elapsedSec) || 0);
-  const elapsed = metadata.duration
-    ? Math.min(elapsedSafe, Math.floor(metadata.duration))
-    : elapsedSafe;
-  const barra = metadata.duration
-    ? `${criarBarraProgresso(elapsed, metadata.duration)}\n\`${formatarTempo(elapsed)} / ${formatarTempo(metadata.duration)}\``
+  const elapsed = durTotal ? Math.min(elapsedSafe, Math.floor(durTotal)) : elapsedSafe;
+  const barra = durTotal
+    ? `${criarBarraProgresso(elapsed, durTotal)}\n\`${formatarTempo(elapsed)} / ${formatarTempo(durTotal)}\``
     : "🔍 *Carregando informações...*";
   const pedidoPor = metadata.requestedBy
     ? `<@${metadata.requestedBy}>`
@@ -105,6 +238,10 @@ function criarPainelMusical(metadata, elapsedSec = 0, flags = {}) {
   const statusExtras = [
     flags.autoplay ? "📻 Autoplay ON" : null,
     flags.loop ? "🔂 Loop ON" : null,
+    flags.bassDb > 0 ? `🔊 Bass +${formatarFx(flags.bassDb)}dB` : null,
+    flags.nightcore !== undefined && flags.nightcore !== 1
+      ? `⚡ ${formatarFx(flags.nightcore)}x`
+      : null,
   ]
     .filter(Boolean)
     .join(" • ");
@@ -211,10 +348,25 @@ function pararStreamAtual(state) {
   state.audioStream = null;
 }
 
-// Flags visuais do painel (autoplay/loop) sem acoplar o state inteiro.
+// Formata número de FX sem zeros à toa (6 -> "6", 1.25 -> "1.25").
+function formatarFx(v) {
+  return String(Number(Number(v).toFixed(2)));
+}
+
+// Flags visuais do painel (autoplay/loop/fx) sem acoplar o state inteiro.
+// Inclui duracaoEfetiva (nightcore) para a barra refletir o fim real da faixa.
 function flagsDoPainel(state) {
   if (!state) return {};
-  return { autoplay: !!state.autoplay, loop: !!state.loop };
+  const fx = state.audioFx || {};
+  return {
+    autoplay: !!state.autoplay,
+    loop: !!state.loop,
+    bassDb: fx.bassDb || 0,
+    nightcore: fx.nightcore || 1,
+    duracaoEfetiva: state.current
+      ? duracaoEfetiva(state.current, state)
+      : null,
+  };
 }
 
 // Gerenciador de painéis (envia o novo, tenta apagar o antigo, e liga a atualização
@@ -278,6 +430,8 @@ function iniciarReproducao(
   pararStreamAtual(state);
 
   // Ajusta o relogio interno para que o timer reflita a posicao real na faixa.
+  // Com nightcore, o audio anda rate x mais rapido que o relogio: escala o
+  // ponto de partida (seekSec respeita a taxa atual do mixer).
   state.playbackStartedAt = Date.now() - seekSec * 1000;
   state.pausedAt = null;
   state.totalPausedMs = 0;
@@ -285,6 +439,7 @@ function iniciarReproducao(
 
   const mixer = new PcmMixer();
   state.pcmMixer = mixer;
+  aplicarFxNoMixer(state);
   const pcmStream = getPcmStreamWithSeek(song.url, seekSec);
   state.audioStream = pcmStream;
   try {
@@ -327,6 +482,7 @@ function iniciarFaixaOtimista(
 
   const mixer = new PcmMixer();
   state.pcmMixer = mixer;
+  aplicarFxNoMixer(state);
   const pcmStream = getPcmStreamWithSeek(streamTarget, seekSec);
   state.audioStream = pcmStream;
   try {
@@ -1729,19 +1885,29 @@ async function seek(guildId, seekSec, message) {
   }
 
   const song = state.current;
-  if (song.duration && seekSec >= song.duration) {
+  // Com nightcore a faixa acaba rate x mais cedo: o limite do seek é a
+  // duração EFETIVA (audível), não a original do YouTube.
+  const durEfetiva = duracaoEfetiva(song, state);
+  if (durEfetiva && seekSec >= durEfetiva) {
     return message.reply("❌ Posição além da duração da música.");
   }
 
   const minutos = Math.floor(seekSec / 60);
   const segundos = seekSec % 60;
-  const label = song.duration
-    ? `${minutos}:${String(segundos).padStart(2, "0")} / ${Math.floor(song.duration / 60)}:${String(Math.floor(song.duration % 60)).padStart(2, "0")}`
+  const label = durEfetiva
+    ? `${minutos}:${String(segundos).padStart(2, "0")} / ${Math.floor(durEfetiva / 60)}:${String(Math.floor(durEfetiva % 60)).padStart(2, "0")}`
     : `${minutos}:${String(segundos).padStart(2, "0")}`;
 
   await message.reply(`⏩ Indo para **${label}** em *${song.title}*...`);
 
-  iniciarReproducao(state, song, true, seekSec);
+  // Seek com nightcore: a posição do usuário é em tempo AUDÍVEL (o que a
+  // barra mostra); o stream precisa do ponto na FONTE (original). Converte:
+  // fonte = audível / rate. Ex: !seek 60 a 1.25x -> byte 48 da fonte.
+  const rate = (state.pcmMixer && state.pcmMixer.playbackRate) || 1;
+  const seekFonte = Math.floor(seekSec / rate);
+  iniciarReproducao(state, song, true, seekFonte);
+  // Reancora o relógio para a posição audível pedida (não para seekFonte).
+  state.playbackStartedAt = Date.now() - seekSec * 1000;
   await enviarNovoPainel(state.textChannel, state, song);
 }
 
@@ -1909,6 +2075,11 @@ module.exports = {
   playSpotifyCollection,
   tocarSfxEntrada,
   limparTimerSfx,
+  setBassBoost,
+  setNightcore,
+  getAudioFx,
+  duracaoEfetiva,
+  rebalancearRelogio,
   iniciarFaixaOtimista,
   prefetchProxima,
   garantirMetadadosCompletos,

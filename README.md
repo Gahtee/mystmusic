@@ -100,6 +100,8 @@ Prefixo `!` (e equivalente `/` onde indicado):
 | `!playlist excluir "Nome"` / `renomear "Antiga" "Nova"` | Exclui / renomeia. |
 | `!playlists` (`/playlists minhas\|servidor`) | Lista playlists. |
 | `!sfx` | Toca efeito aleatório (só dono). Com música: por cima; idle: solto. |
+| `!bass [dB\|off]` (`/bass`) | Bass boost (padrão +6dB, sem limite; sem arg liga/desliga). Aplica na hora. |
+| `!nightcore [taxa\|off]` (`/nightcore`) | Nightcore (padrão 1.25x, 0.5–3; sem arg liga/desliga). A faixa acaba mais cedo. |
 | `!botmorreu` / `!botbosta` | Reinicia o bot via pm2. |
 | `!help` | Ajuda. |
 

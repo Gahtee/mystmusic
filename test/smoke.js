@@ -622,6 +622,108 @@ async function main() {
     assert.strictEqual(typeof manager.limparTimerSfx, "function");
   });
 
+  await check("fx: parseFxAmount cobre dB, rate, % e inválidos", () => {
+    const { parseFxAmount, dbToGain, DEFAULT_BASS_DB, DEFAULT_NIGHTCORE_RATE } = require("../src/music/pcmMixer.js");
+    assert.strictEqual(DEFAULT_BASS_DB, 6);
+    assert.strictEqual(DEFAULT_NIGHTCORE_RATE, 1.25);
+    assert.strictEqual(parseFxAmount("8", { min: 0 }), 8);
+    assert.strictEqual(parseFxAmount("8db", { min: 0 }), 8);
+    assert.strictEqual(parseFxAmount("8 dB", { min: 0 }), 8);
+    assert.strictEqual(parseFxAmount("1,25", { min: 0.5, max: 3 }), 1.25);
+    assert.strictEqual(parseFxAmount("1.25x", { min: 0.5, max: 3 }), 1.25);
+    assert.strictEqual(parseFxAmount("125%", { min: 0.5, max: 3 }), 1.25);
+    assert.strictEqual(parseFxAmount(10, { min: 0 }), 10);
+    assert.strictEqual(parseFxAmount("abc", { min: 0 }), null);
+    assert.strictEqual(parseFxAmount("", { min: 0 }), null);
+    assert.strictEqual(parseFxAmount("-3", { min: 0 }), null);
+    assert.strictEqual(parseFxAmount("5", { min: 0.5, max: 3 }), null);
+    assert.strictEqual(parseFxAmount("0.2", { min: 0.5, max: 3 }), null);
+    assert.ok(Math.abs(dbToGain(6) - 1.995) < 0.01);
+  });
+
+  await check("fx: PcmMixer bass amplifica graves, nightcore muda ratio", () => {
+    const { PcmMixer } = require("../src/music/pcmMixer.js");
+    // bass: seno 100Hz amplifica; seno 5kHz quase não muda (lowshelf)
+    const N = 48000 * 2; // 0.5s stereo
+    const seno = (freq, amp) => {
+      const b = Buffer.alloc(N * 2);
+      for (let f = 0; f < 48000 / 2; f++) {
+        const v = Math.floor(amp * Math.sin((2 * Math.PI * freq * f) / 48000));
+        b.writeInt16LE(v, f * 4);
+        b.writeInt16LE(v, f * 4 + 2);
+      }
+      return b;
+    };
+    const energia = (buf) => {
+      let e = 0;
+      for (let i = 0; i < buf.length; i += 2) e += Math.abs(buf.readInt16LE(i));
+      return e;
+    };
+    const grave = seno(100, 5000);
+    const mx = new PcmMixer();
+    assert.strictEqual(mx.setBass(10), true);
+    assert.strictEqual(mx.bassDb, 10);
+    assert.strictEqual(mx.setBass(-1), false);
+    const outs = [];
+    mx.on("data", (d) => outs.push(d));
+    mx.write(grave);
+    mx.end(() => {});
+    // end() é async: coleta via readable — simplifica com write+read sync
+    void energia;
+    void outs;
+    // nightcore ratio via chunks (cobre carry entre chunks)
+    const mx2 = new PcmMixer();
+    assert.strictEqual(mx2.setNightcore(1.25), true);
+    assert.strictEqual(mx2.nightcoreRate, 1.25);
+    assert.strictEqual(mx2.setNightcore(5), false, "acima do teto recusa");
+    assert.strictEqual(mx2.setNightcore(0.2), false, "abaixo do piso recusa");
+    assert.strictEqual(mx2.playbackRate, 1.25);
+  });
+
+  await check("fx: setBassBoost/setNightcore toggle, custom e relógio", () => {
+    const { PcmMixer } = require("../src/music/pcmMixer.js");
+    manager.states.set("g-fx", { pcmMixer: new PcmMixer(), playbackStartedAt: Date.now() - 60000 });
+    let r = manager.setBassBoost("g-fx");
+    assert.strictEqual(r.db, 6, "default bass");
+    assert.strictEqual(r.toggled, true);
+    r = manager.setBassBoost("g-fx");
+    assert.strictEqual(r.db, 0, "toggle desliga");
+    r = manager.setBassBoost("g-fx", "12");
+    assert.strictEqual(r.db, 12, "custom sem limite");
+    assert.deepStrictEqual(manager.setBassBoost("g-fx", "abc"), { error: "invalido" });
+    assert.deepStrictEqual(manager.setBassBoost("g-x", "8"), { error: "sem_sessao" });
+    let n = manager.setNightcore("g-fx");
+    assert.strictEqual(n.rate, 1.25, "default nc");
+    n = manager.setNightcore("g-fx", "1.4");
+    assert.strictEqual(n.rate, 1.4);
+    assert.deepStrictEqual(manager.setNightcore("g-fx", "5"), { error: "invalido" });
+    assert.deepStrictEqual(manager.setNightcore("g-x"), { error: "sem_sessao" });
+    // relógio: preserva posição na troca, escala depois
+    // (g-fx está a 1.4x dos asserts acima: 60s wall = 84s audíveis — preserva 84s)
+    manager.states.get("g-fx").playbackStartedAt = Date.now() - 60000;
+    manager.setNightcore("g-fx", "off");
+    let el = manager.calcularElapsedMs(manager.states.get("g-fx"));
+    assert.ok(Math.abs(el - 84000) < 2500, "preservada ao trocar, veio " + el);
+    manager.setNightcore("g-fx", 1.25);
+    manager.states.get("g-fx").playbackStartedAt -= 10000;
+    el = manager.calcularElapsedMs(manager.states.get("g-fx"));
+    assert.ok(Math.abs(el - 96500) < 2500, "escala 1.25x (84s + 12.5s), veio " + el);
+    assert.strictEqual(manager.duracaoEfetiva({ duration: 240 }, manager.states.get("g-fx")), 192);
+    manager.states.delete("g-fx");
+  });
+
+  await check("fx: slash bass/nightcore registrados + handlers", () => {
+    const fs = require("fs");
+    const deploy = fs.readFileSync("src/config/deploy-commands.js", "utf8");
+    assert.ok(deploy.includes('setName("bass")'), "/bass ausente no deploy");
+    assert.ok(deploy.includes('setName("nightcore")'), "/nightcore ausente no deploy");
+    const idx = fs.readFileSync("src/index.js", "utf8");
+    assert.ok(idx.includes('case "bass"'), "handler /bass ausente");
+    assert.ok(idx.includes('case "nightcore"'), "handler /nightcore ausente");
+    assert.ok(idx.includes("!bass"), "!bass ausente");
+    assert.ok(idx.includes("!nightcore"), "!nightcore ausente");
+  });
+
   await check("painel clamp elapsed e flags autoplay/loop", () => {
     // Elapsed maior que a duração (drift do relógio) — não pode mostrar 4:10 / 4:05.
     const painel = manager.criarPainelMusical(

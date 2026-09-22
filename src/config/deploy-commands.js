@@ -69,6 +69,26 @@ const commands = [
     .setDescription("Ativa/desativa a repetição da música atual"),
 
   new SlashCommandBuilder()
+    .setName("bass")
+    .setDescription("Bass boost configurável (padrão +6dB, sem limite)")
+    .addStringOption((opt) =>
+      opt
+        .setName("nivel")
+        .setDescription("dB de reforço (ex: 8) — vazio liga/desliga, 0 desliga")
+        .setRequired(false),
+    ),
+
+  new SlashCommandBuilder()
+    .setName("nightcore")
+    .setDescription("Nightcore configurável (padrão 1.25x, 0.5–3)")
+    .addStringOption((opt) =>
+      opt
+        .setName("taxa")
+        .setDescription("Velocidade/pitch (ex: 1.4) — vazio liga/desliga")
+        .setRequired(false),
+    ),
+
+  new SlashCommandBuilder()
     .setName("np")
     .setDescription("Mostra o painel da música atual"),
 

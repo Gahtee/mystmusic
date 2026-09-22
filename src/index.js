@@ -41,6 +41,10 @@ const {
   listarTodasPlaylists,
   listarPlaylistsDoServidor,
   tocarSfxEntrada,
+  setBassBoost,
+  setNightcore,
+  getAudioFx,
+  duracaoEfetiva,
   states,
 } = require("./music/manager");
 const {
@@ -267,9 +271,13 @@ async function handleSlashNp(interaction) {
     });
   }
   const elapsedSec = Math.floor(calcularElapsedMs(state) / 1000);
+  const fx = getAudioFx(state);
   const painel = criarPainelMusical(state.current, elapsedSec, {
     autoplay: !!state.autoplay,
     loop: !!state.loop,
+    bassDb: fx.bassDb,
+    nightcore: fx.nightcore,
+    duracaoEfetiva: duracaoEfetiva(state.current, state),
   });
   return interaction.reply({ ...painel, ephemeral: false });
 }
@@ -684,6 +692,48 @@ async function handleSlashCommand(interaction) {
       return interaction.reply(
         ativado ? "🔂 Loop **ativado**." : "🔂 Loop **desativado**.",
       );
+    }
+    case "bass": {
+      const raw = interaction.options.getString("nivel");
+      const res = setBassBoost(guildId, raw ?? undefined);
+      if (res.error === "sem_sessao")
+        return interaction.reply({
+          content: "❌ Não há nenhuma sessão de música ativa neste servidor.",
+          ephemeral: true,
+        });
+      if (res.error === "invalido")
+        return interaction.reply({
+          content: "❌ Valor inválido. Use um número em dB (ex: 8) ou deixe vazio para ligar/desligar.",
+          ephemeral: true,
+        });
+      return interaction.reply({
+        content:
+          res.db === 0
+            ? "🔊 Bass boost **desativado**."
+            : `🔊 Bass boost **+${Number(res.db.toFixed ? res.db.toFixed(2) : res.db)}dB** — aplica na hora.`,
+        ephemeral: true,
+      });
+    }
+    case "nightcore": {
+      const raw = interaction.options.getString("taxa");
+      const res = setNightcore(guildId, raw ?? undefined);
+      if (res.error === "sem_sessao")
+        return interaction.reply({
+          content: "❌ Não há nenhuma sessão de música ativa neste servidor.",
+          ephemeral: true,
+        });
+      if (res.error === "invalido")
+        return interaction.reply({
+          content: "❌ Valor inválido. Use uma taxa de 0.5 a 3 (ex: 1.25) ou deixe vazio para ligar/desligar.",
+          ephemeral: true,
+        });
+      return interaction.reply({
+        content:
+          res.rate === 1
+            ? "⚡ Nightcore **desativado**."
+            : `⚡ Nightcore **${Number(res.rate.toFixed ? res.rate.toFixed(2) : res.rate)}x** — a faixa anda mais rápido.`,
+        ephemeral: true,
+      });
     }
     case "remove": {
       const posicao = interaction.options.getInteger("posicao");
@@ -1187,6 +1237,42 @@ client.on("messageCreate", async (message) => {
     );
   }
 
+  if (
+    message.content.startsWith("!bass") ||
+    message.content.startsWith("!grave")
+  ) {
+    const arg = message.content.split(/\s+/).slice(1).join(" ") || undefined;
+    const res = setBassBoost(message.guild.id, arg);
+    if (res.error === "sem_sessao")
+      return message.reply("❌ Não há nenhuma sessão de música ativa neste servidor.");
+    if (res.error === "invalido")
+      return message.reply(
+        "❌ Valor inválido. Use `!bass` (liga/desliga, padrão +6dB), `!bass <dB>` (ex: `!bass 10`) ou `!bass off`.",
+      );
+    if (res.db === 0) return message.reply("🔊 Bass boost **desativado**.");
+    return message.reply(
+      `🔊 Bass boost **+${Number(res.db.toFixed ? res.db.toFixed(2) : res.db)}dB**${res.toggled ? " (padrão)" : ""} — aplica na hora, vale para a sessão toda.`,
+    );
+  }
+
+  if (
+    message.content.startsWith("!nightcore") ||
+    message.content.startsWith("!nc")
+  ) {
+    const arg = message.content.split(/\s+/).slice(1).join(" ") || undefined;
+    const res = setNightcore(message.guild.id, arg);
+    if (res.error === "sem_sessao")
+      return message.reply("❌ Não há nenhuma sessão de música ativa neste servidor.");
+    if (res.error === "invalido")
+      return message.reply(
+        "❌ Valor inválido. Use `!nightcore` (liga/desliga, padrão 1.25x), `!nightcore <taxa>` (0.5–3, ex: `!nightcore 1.4`) ou `!nightcore off`.",
+      );
+    if (res.rate === 1) return message.reply("⚡ Nightcore **desativado**.");
+    return message.reply(
+      `⚡ Nightcore **${Number(res.rate.toFixed ? res.rate.toFixed(2) : res.rate)}x**${res.toggled ? " (padrão)" : ""} — a faixa anda mais rápido e acaba mais cedo.`,
+    );
+  }
+
   if (message.content.startsWith("!move")) {
     const args = message.content.split(/\s+/);
     const de = parseInt(args[1]);
@@ -1217,9 +1303,13 @@ client.on("messageCreate", async (message) => {
     }
 
     const elapsedSec = Math.floor(calcularElapsedMs(state) / 1000);
+    const fxNp = getAudioFx(state);
     const painel = criarPainelMusical(state.current, elapsedSec, {
       autoplay: !!state.autoplay,
       loop: !!state.loop,
+      bassDb: fxNp.bassDb,
+      nightcore: fxNp.nightcore,
+      duracaoEfetiva: duracaoEfetiva(state.current, state),
     });
     message.channel.send(painel);
   }
@@ -1377,6 +1467,8 @@ client.on("messageCreate", async (message) => {
             "`!loop` — Ativa/desativa repetição da música atual\n" +
             "`!seek <tempo>` — Vai para um trecho da música (ex: `10:20`, `1:12:14`, `00:15`, `15`)\n" +
             "`!shuffle` / `!misturar` — Embaralha a fila\n" +
+            "`!bass [dB|off]` — Bass boost (padrão +6dB, sem limite; sem arg liga/desliga)\n" +
+            "`!nightcore [taxa|off]` — Nightcore (padrão 1.25x, 0.5–3; sem arg liga/desliga)\n" +
             "`!np` — Mostra o painel da música atual",
         },
         {

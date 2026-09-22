@@ -1,23 +1,18 @@
-// Mixer de PCM em tempo real para o SFX de entrada do dono.
-//
+// Mixer de PCM em tempo real para o SFX de entrada do dono + efeitos de áudio.
 // Arquitetura: fica PERMANENTEMENTE entre a saida de PCM da musica e o encoder
-// Opus do @discordjs/voice. Por padrao repassa os chunks sem alteracao
-// (overhead ~O(n) memcpy). playOverlay(buffer) soma um buffer de efeito
-// pre-decodificado por cima das amostras seguintes, com duck da musica e
-// clipping — sem nunca interromper o fluxo principal.
-//
+// Opus do @discordjs/voice. Cadeia por chunk: bass boost (lowshelf aprox. via
+// one-pole) -> nightcore (resample linear acoplado tempo+pitch) -> overlay SFX
+// (duck + clipping). Sem overlay e sem FX, repasse bit-identico.
 // Formato: s16le, 48000Hz, estereo (o que o encoder Opus do prism espera:
 // rate 48k, channels 2, frameSize 960). Tamanho de chunk NAO precisa alinhar
-// em frame: o encoder acumula internamente. Restos impares (< 2 bytes) sao
-// guardados para o proximo chunk.
-//
-// Soma com clipping int16: s = a + b, clamp em [-32768, 32767].
-// Duck: durante a janela do overlay, amostras da musica sao multiplicadas por
-// duckGain (0.35) e o SFX por sfxGain (2.5 — o chime padrao e suave, -21dB RMS).
+// em frame: o encoder acumula internamente. Restos (< 1 frame stereo = 4 bytes)
+// sao guardados para o proximo chunk.
+// Ordem proposital: o SFX entra DEPOIS de bass/nightcore — o chime toca sempre
+// limpo, em velocidade normal, mesmo com a musica nightcorada.
 // Modo standalone: sem musica (silencio como base), o mixer gera PCM do zero
 // a partir do overlay — usado para tocar o SFX "solto" quando nada esta tocando.
-// Nesse modo o proprio mixer alimenta o player ate o overlay esgotar e entao
-// emite 'overlay-done' (o manager destroi o player temporario em seguida).
+// Standalone ignora bass/nightcore (efeito limpo) e emite 'overlay-done'
+// (o manager destroi o player temporario em seguida).
 
 const { Transform } = require("stream");
 
@@ -31,6 +26,57 @@ const BYTES_PER_SAMPLE = 2;
 const DEFAULT_DUCK_GAIN = 0.35;
 const DEFAULT_SFX_GAIN = 2.5;
 const MAX_OVERLAYS = 4; // fila curta: join em loop nao empilha infinito
+
+// ── Efeitos de áudio (bass + nightcore) ─────────────────────────────────────
+// Padrões: bass 6dB (reforço audível sem estourar), nightcore 1.25x.
+// Sem limite superior: o usuário passa qualquer valor >= 0 (bass dB) ou
+// > 0 (rate). Valores absurdos clipam (protegido por clamp16) ou aceleram
+// muito — por conta do usuário.
+const DEFAULT_BASS_DB = 6;
+const DEFAULT_NIGHTCORE_RATE = 1.25;
+// Trava de segurança do resample: evita rate absurdo (ex: 50x) alocar
+// buffer gigante ou travar o loop. Cobre qualquer uso musical real.
+const MAX_NIGHTCORE_RATE = 3;
+const MIN_NIGHTCORE_RATE = 0.5;
+// Corte do bass (Hz): só frequências abaixo disso são reforçadas.
+const BASS_CUTOFF_HZ = 120;
+
+// dB -> ganho linear.
+function dbToGain(db) {
+  return Math.pow(10, db / 20);
+}
+
+// Coeficiente one-pole lowpass p/ o corte (por canal): alpha = 1 - exp(-2πfc/fs).
+// Não precisa de validação extra: fc e fs são constantes internas.
+function lowpassAlpha() {
+  return 1 - Math.exp((-2 * Math.PI * BASS_CUTOFF_HZ) / SAMPLE_RATE);
+}
+const BASS_ALPHA = lowpassAlpha();
+
+// Normaliza entradas de usuário (aceita string de comando). Retorna número
+// finito ou null (inválido). min/max opcionais; sem max = sem limite.
+function parseFxAmount(raw, { min = 0, max = null } = {}) {
+  if (typeof raw === "number") {
+    if (!Number.isFinite(raw) || raw < min) return null;
+    if (max !== null && raw > max) return null;
+    return raw;
+  }
+  if (typeof raw !== "string") return null;
+  // Aceita "8", "8db", "8 dB", "1.25x", "125%", "1,25" (vírgula BR).
+  let s = raw.trim().toLowerCase().replace(",", ".");
+  let v;
+  if (s.endsWith("%")) {
+    v = parseFloat(s.slice(0, -1));
+    if (!Number.isFinite(v)) return null;
+    v = v / 100; // "125%" -> 1.25 (rate); p/ bass, % não faz sentido mas segue linear
+  } else {
+    v = parseFloat(s.replace(/(db|x)$/, ""));
+    if (!Number.isFinite(v)) return null;
+  }
+  if (v < min) return null;
+  if (max !== null && v > max) return null;
+  return v;
+}
 
 function clamp16(v) {
   if (v > 32767) return 32767;
@@ -47,11 +93,57 @@ class PcmMixer extends Transform {
         : DEFAULT_DUCK_GAIN;
     this.sfxGain =
       typeof options.sfxGain === "number" ? options.sfxGain : DEFAULT_SFX_GAIN;
-    // Fila de overlays pendentes (cada um: { pcm, offset, duck, sfx, delay }).
-    // delay em AMOSTRAS (por canal): permite o adelay de 1s sem ffmpeg.
-    this._queue = [];
-    this._resto = Buffer.alloc(0); // bytes impares entre chunks
-    this._playing = false; // true enquanto ha overlay ativo
+  // Fila de overlays pendentes (cada um: { pcm, offset, duck, sfx, delay }).
+  // delay em AMOSTRAS (por canal): permite o adelay de 1s sem ffmpeg.
+  this._queue = [];
+  this._resto = Buffer.alloc(0); // bytes impares entre chunks
+  this._playing = false; // true enquanto ha overlay ativo
+  // ── Estado dos FX ──
+  this._bassDb = 0; // 0 = desligado; > 0 = reforço em dB (sem limite)
+  this._bassGain = 1; // linear, derivado de _bassDb
+  this._bassY = [0, 0]; // estado one-pole por canal (persiste entre chunks!)
+  this._ncRate = 1; // 1 = desligado; ex: 1.25 = nightcore padrão
+  this._ncPos = 0; // posição fracionária no fluxo de entrada (em amostras/canal)
+  this._ncCarry = []; // amostras de borda p/ interpolação entre chunks (por canal)
+  }
+
+  // ── Bass boost ──────────────────────────────────────────────────────────
+  // db = 0 desliga. Sem limite superior (clamp16 protege de estouro).
+  setBass(db) {
+    if (typeof db !== "number" || !Number.isFinite(db) || db < 0) return false;
+    this._bassDb = db;
+    this._bassGain = dbToGain(db);
+    if (db === 0) this._bassY = [0, 0]; // reseta estado ao desligar (sem "cauda")
+    return true;
+  }
+
+  get bassDb() {
+    return this._bassDb;
+  }
+
+  // ── Nightcore ───────────────────────────────────────────────────────────
+  // rate = 1 desliga. Aceita (0.5..3): fora disso retorna false.
+  setNightcore(rate) {
+    if (typeof rate !== "number" || !Number.isFinite(rate)) return false;
+    if (rate !== 1 && (rate < MIN_NIGHTCORE_RATE || rate > MAX_NIGHTCORE_RATE)) {
+      return false;
+    }
+    this._ncRate = rate;
+    // Posição/estado zerados na troca para não interpolar lixo entre taxas.
+    // (Troca no meio da faixa dá um click de ~1 amostra — aceitável p/ toggle.)
+    this._ncPos = 0;
+    this._ncCarry = [];
+    return true;
+  }
+
+  get nightcoreRate() {
+    return this._ncRate;
+  }
+
+  // Taxa efetiva de consumo: quantas amostras de entrada viram 1 de saída.
+  // O manager usa para escalar o relógio (elapsed) e a barra de progresso.
+  get playbackRate() {
+    return this._ncRate;
   }
 
   get playing() {
@@ -87,6 +179,8 @@ class PcmMixer extends Transform {
 
   // Limpa overlays pendentes/ativo sem tocar no fluxo da musica.
   // Usado em skip/stop: o efeito nao vaza para a proxima faixa.
+  // NOTA: nao reseta bass/nightcore (sao config da SESSAO, persistem entre
+  // faixas — ver setBass/setNightcore e audioFx no state do manager).
   clearOverlays() {
     this._queue.length = 0;
     this._playing = false;
@@ -148,25 +242,43 @@ class PcmMixer extends Transform {
         input = Buffer.concat([this._resto, chunk]);
         this._resto = Buffer.alloc(0);
       }
-      // Guarda byte impar para o proximo chunk (amostra s16le = 2 bytes).
+      // Guarda bytes que não formam frame stereo completo (4 bytes = L+R).
+      // Necessário p/ o nightcore: a interpolação lê pares (i0,i1) por canal,
+      // então a borda do chunk precisa de amostras inteiras por canal.
+      // Casos exclusivos: ímpar (1 byte sobrando) ou par-não-múltiplo-de-4.
       if (input.length % 2 === 1) {
         this._resto = input.slice(input.length - 1);
         input = input.slice(0, input.length - 1);
+      } else if (input.length % (CHANNELS * BYTES_PER_SAMPLE) !== 0) {
+        this._resto = input.slice(input.length - 2);
+        input = input.slice(0, input.length - 2);
       }
       if (input.length === 0) return done();
 
+      // ETAPA 1 — bass + nightcore na música (antes do overlay; o SFX entra
+      // limpo depois). Sem FX e sem overlay: repasse direto bit-idêntico.
+      const bassOn = this._bassDb > 0;
+      const ncOn = this._ncRate !== 1;
+      let musicBuf = input;
+      if (bassOn || ncOn) {
+        musicBuf = this._aplicarFx(input);
+        // Nightcore com rate > 1 pode esvaziar o chunk (consome mais do que
+        // produz); sem bytes de saída, só aguarda o próximo chunk.
+        if (!musicBuf || musicBuf.length === 0) return done();
+      }
+
       if (this._queue.length === 0) {
-        // Fast path: sem overlay, repasse direto (zero copia extra alem do push).
         this._playing = false;
-        this.push(input);
+        this.push(musicBuf);
         return done();
       }
 
-      const out = Buffer.allocUnsafe(input.length);
-      const nSamples = input.length / 2; // amostras totais (L+R intercalados)
+      // ETAPA 2 — overlay SFX por cima (duck + clipping), como antes.
+      const out = Buffer.allocUnsafe(musicBuf.length);
+      const nSamples = musicBuf.length / 2; // amostras totais (L+R intercalados)
 
       for (let i = 0; i < nSamples; i++) {
-        let music = input.readInt16LE(i * 2);
+        let music = musicBuf.readInt16LE(i * 2);
         let mixed = music;
         let duckAtivo = false;
 
@@ -175,6 +287,8 @@ class PcmMixer extends Transform {
           const ov = this._queue[q];
           if (ov.delayLeft > 0) {
             // Delay conta em amostras POR CANAL: decrementa a cada 2 amostras.
+            // NOTA: com nightcore o tempo de saída anda 1.25x — o delay do SFX
+            // chega ~20% antes. Aceitável (efeito de 1s, erro de 200ms).
             if (i % CHANNELS === CHANNELS - 1) ov.delayLeft--;
             continue;
           }
@@ -209,6 +323,129 @@ class PcmMixer extends Transform {
     }
   }
 
+  // Aplica bass (lowshelf aproximado) + nightcore (resample linear acoplado).
+  // Entrada/saída: Buffer s16le stereo. Retorna novo Buffer (pode ser menor
+  // que a entrada com rate > 1, ou maior com rate < 1).
+  _aplicarFx(input) {
+    const nFrames = Math.floor(input.length / (CHANNELS * BYTES_PER_SAMPLE));
+    if (nFrames === 0) return Buffer.alloc(0);
+
+    const bassOn = this._bassDb > 0;
+    const rate = this._ncRate;
+    // Nº de frames de SAÍDA: percorre a posição fracionária até esgotar.
+    // Com rate == 1, saída tem o mesmo nº de frames da entrada.
+    let outFrames;
+    if (rate === 1) {
+      outFrames = nFrames;
+    } else {
+      // Amostras de entrada disponíveis (inclui carry de borda do chunk anterior).
+      const carryFrames = Math.floor(this._ncCarry.length / CHANNELS);
+      const totalIn = carryFrames + nFrames;
+      outFrames = Math.max(
+        0,
+        Math.floor((totalIn - this._ncPos - 1) / rate) + 1,
+      );
+      if (outFrames <= 0) {
+        // Entrada insuficiente p/ 1 frame de saída: acumula no carry e espera.
+        this._acumularCarry(input);
+        return Buffer.alloc(0);
+      }
+    }
+
+    const out = Buffer.allocUnsafe(outFrames * CHANNELS * BYTES_PER_SAMPLE);
+    // Monta janela de leitura: carry (borda anterior) + input atual, como
+    // Int16 por canal para interpolação.
+    let janela = null;
+    if (rate !== 1) {
+      janela = this._montarJanela(input, nFrames);
+    }
+
+    for (let f = 0; f < outFrames; f++) {
+      for (let c = 0; c < CHANNELS; c++) {
+        let v;
+        if (rate === 1) {
+          v = input.readInt16LE((f * CHANNELS + c) * BYTES_PER_SAMPLE);
+        } else {
+          const pos = this._ncPos + f * rate;
+          const i0 = Math.floor(pos);
+          const frac = pos - i0;
+          const a = janela[i0 * CHANNELS + c];
+          const b =
+            i0 + 1 < janela.length / CHANNELS
+              ? janela[(i0 + 1) * CHANNELS + c]
+              : a; // borda: repete (evita clique)
+          v = Math.round(a + (b - a) * frac);
+        }
+        if (bassOn) {
+          // Lowshelf aproximado: lowpass one-pole do sinal + reforço.
+          // y += alpha*(x - y); out = x + (gain-1)*y
+          const y =
+            this._bassY[c] + BASS_ALPHA * (v - this._bassY[c]);
+          this._bassY[c] = y;
+          v = Math.round(v + (this._bassGain - 1) * y);
+        }
+        out.writeInt16LE(clamp16(v), (f * CHANNELS + c) * BYTES_PER_SAMPLE);
+      }
+    }
+
+    if (rate !== 1) {
+      // Avança a posição e guarda a cauda não consumida como carry (até 2
+      // frames de borda p/ a interpolação do próximo chunk).
+      const consumidos = this._ncPos + (outFrames - 1) * rate;
+      const primeiroNaoConsumido = Math.floor(consumidos) + 1;
+      const carryFrames = Math.floor(this._ncCarry.length / CHANNELS);
+      const totalFrames = carryFrames + nFrames;
+      // Reconstrói os valores da janela p/ guardar a cauda (janela[] local).
+      const resto = totalFrames - primeiroNaoConsumido;
+      const guardar = Math.min(Math.max(resto, 0), 2);
+      const novoCarry = [];
+      for (let f = totalFrames - guardar; f < totalFrames; f++) {
+        for (let c = 0; c < CHANNELS; c++) {
+          novoCarry.push(janela[f * CHANNELS + c]);
+        }
+      }
+      this._ncCarry = novoCarry;
+      this._ncPos = consumidos - Math.floor(consumidos);
+    }
+    return out;
+  }
+
+  // Acumula input no carry quando não há dados suficientes p/ 1 frame de saída.
+  _acumularCarry(input) {
+    const nFrames = Math.floor(input.length / (CHANNELS * BYTES_PER_SAMPLE));
+    // Cap: carry nunca passa de 4 frames (evita crescimento com rate absurdo).
+    const espaco = Math.max(0, 4 - Math.floor(this._ncCarry.length / CHANNELS));
+    const usar = Math.min(nFrames, espaco);
+    for (let f = nFrames - usar; f < nFrames; f++) {
+      for (let c = 0; c < CHANNELS; c++) {
+        this._ncCarry.push(
+          input.readInt16LE((f * CHANNELS + c) * BYTES_PER_SAMPLE),
+        );
+      }
+    }
+    // Se o input tinha MAIS que o espaço (chunk grande + rate alto), descarta
+    // o excedente antigo (mantém só a cauda): evita drift de latência.
+    while (this._ncCarry.length > 4 * CHANNELS) {
+      this._ncCarry.splice(0, CHANNELS);
+    }
+  }
+
+  // Monta a janela de leitura [carry + input] como array plano de Int16.
+  _montarJanela(input, nFrames) {
+    const carryFrames = Math.floor(this._ncCarry.length / CHANNELS);
+    const total = carryFrames + nFrames;
+    const janela = new Array(total * CHANNELS);
+    for (let i = 0; i < this._ncCarry.length; i++) janela[i] = this._ncCarry[i];
+    for (let f = 0; f < nFrames; f++) {
+      for (let c = 0; c < CHANNELS; c++) {
+        janela[(carryFrames + f) * CHANNELS + c] = input.readInt16LE(
+          (f * CHANNELS + c) * BYTES_PER_SAMPLE,
+        );
+      }
+    }
+    return janela;
+  }
+
   _flush(done) {
     this._resto = Buffer.alloc(0);
     done();
@@ -223,5 +460,12 @@ module.exports = {
   DEFAULT_DUCK_GAIN,
   DEFAULT_SFX_GAIN,
   MAX_OVERLAYS,
+  DEFAULT_BASS_DB,
+  DEFAULT_NIGHTCORE_RATE,
+  MAX_NIGHTCORE_RATE,
+  MIN_NIGHTCORE_RATE,
+  BASS_CUTOFF_HZ,
   clamp16,
+  dbToGain,
+  parseFxAmount,
 };
