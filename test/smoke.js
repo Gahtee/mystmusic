@@ -858,7 +858,7 @@ async function main() {
         const stream = resolver.getPcmStream(TEST_URL);
         assert.ok(stream && typeof stream.on === "function", "stream inválido");
         const gotBytes = await new Promise((resolve) => {
-          const t = setTimeout(() => resolve(false), 20000);
+          const t = setTimeout(() => resolve(false), 40000);
           stream.once("data", () => {
             clearTimeout(t);
             resolve(true);
@@ -872,7 +872,7 @@ async function main() {
         const buf = await new Promise((resolve) => {
           const chunks = [];
           let total = 0;
-          const t = setTimeout(() => resolve(Buffer.concat(chunks)), 20000);
+          const t = setTimeout(() => resolve(Buffer.concat(chunks)), 40000);
           stream.on("data", (d) => {
             chunks.push(d);
             total += d.length;
@@ -887,7 +887,7 @@ async function main() {
         const mortos = (stream._childProcesses || []).every(
           (p) => p.killed || p.exitCode !== null,
         );
-        assert.ok(gotBytes, "yt-dlp+ffmpeg PCM não emitiu bytes em 20s");
+        assert.ok(gotBytes, "yt-dlp+ffmpeg PCM não emitiu bytes em 40s");
         assert.ok(buf.length >= 8192, "PCM curto demais");
         assert.strictEqual(buf.length % 2, 0, "PCM com byte ímpar (s16le quebrado)");
         // Energia: soma abs das amostras — silêncio total indica decode falho

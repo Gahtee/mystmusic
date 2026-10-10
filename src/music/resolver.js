@@ -19,8 +19,27 @@ function cookieArgs() {
   return [];
 }
 
-const YTDLP_TIMEOUT_MS = 30_000;
+const YTDLP_TIMEOUT_MS = 60_000;
 const YTDLP_MAX_BUFFER = 1024 * 1024 * 20;
+
+// PO Token via bgutil provider local (docker em 127.0.0.1:4416).
+// Mitiga HTTP 403 / "Sign in to confirm you're not a bot" em IP de datacenter.
+// Clientes mweb,tv,web_safari disparam o fluxo POT; se o servidor local cair,
+// o yt-dlp segue sem token (não quebra a extração).
+const POT_BASE_URL = process.env.POT_BASE_URL || "http://127.0.0.1:4416";
+
+function potArgs() {
+  return [
+    "--extractor-args",
+    `youtube:player-client=mweb,tv,web_safari;youtubepot-bgutilhttp:base_url=${POT_BASE_URL}`,
+    "--retries",
+    "3",
+    "--fragment-retries",
+    "3",
+    "--sleep-requests",
+    "1",
+  ];
+}
 
 function stderrOf(err) {
   if (!err) return "";
@@ -196,6 +215,7 @@ async function getAudioMetadata(query, searchEngine = "ytsearch") {
 
   const args = [
     ...cookieArgs(),
+    ...potArgs(),
     "--js-runtimes",
     "node",
     "--no-playlist",
@@ -230,6 +250,7 @@ async function getAudioMetadata(query, searchEngine = "ytsearch") {
 async function getPlaylistMetadata(playlistUrl) {
   const args = [
     ...cookieArgs(),
+    ...potArgs(),
     "--js-runtimes",
     "node",
     "--flat-playlist",
@@ -306,6 +327,7 @@ function attachProcesses(stream, processes) {
 function getPcmStreamWithSeek(url, seekSec = 0) {
   const baseArgs = [
     ...cookieArgs(),
+    ...potArgs(),
     "-f",
     "bestaudio[acodec=opus]/bestaudio/best",
     "--js-runtimes",
@@ -374,6 +396,7 @@ function getPcmStreamWithSeek(url, seekSec = 0) {
 function getPcmStream(url) {
   const baseArgs = [
     ...cookieArgs(),
+    ...potArgs(),
     "-f",
     "bestaudio[acodec=opus]/bestaudio/best",
     "--js-runtimes",

@@ -1106,19 +1106,21 @@ async function play(message, query, searchEngine = "ytsearch") {
         try {
           await metaP;
         } catch (err) {
-          // Extração falhou: remove o placeholder e informa o motivo.
-          state.queue = state.queue.filter((s) => s !== placeholder);
-          if (state.current === placeholder) state.current = null;
-          console.error("Erro no processamento:", err);
+          // Stream já está tocando (play otimista): não remove a faixa nem
+          // mostra "Falha ao buscar" — só loga e mantém o painel provisório
+          // ("Buscando dados da faixa..."). O áudio segue normal.
+          console.error("Falha nos metadados (stream segue tocando):", err.message);
+          await enviarNovoPainel(message.channel, state, placeholder).catch(
+            () => {},
+          );
           savePlayLog(
             guildId,
             message.author.id,
             query,
-            null,
-            "FAILED",
-            err.message,
+            placeholder.title || query,
+            "SUCCESS",
           );
-          return message.reply(err.message || "Deu erro ao buscar a música.");
+          return;
         }
         await enviarNovoPainel(message.channel, state, placeholder).catch(
           () => {},
