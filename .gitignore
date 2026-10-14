@@ -1,7 +1,11 @@
 /.env
+/.env.bot2
 /cookies.txt
 /db/logs.db
 /db/playlists.db
+/db/*.db-wal
+/db/*.db-shm
+/db/*.db-journal
 node_modules/
 # Efeitos pessoais (.mp3 que você colocar em sounds/ não sobem pro git).
 # O chime padrão (entrada.mp3, gerado por script) sobe normalmente.

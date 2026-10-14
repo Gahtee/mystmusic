@@ -6,9 +6,21 @@ const fs = require("fs");
 const logsDbPath = path.resolve(__dirname, "../../db/logs.db");
 const playlistDbPath = path.resolve(__dirname, "../../db/playlists.db");
 
-// Inicializa as conexões
+// Inicializa as conexões.
+// Modo multi-processo (2 bots dividindo o mesmo db/*.db): WAL permite 1
+// escritor + N leitores sem "SQLITE_BUSY: database is locked", e o
+// busy_timeout faz o 2º escritor esperar em vez de falhar na hora.
 const logsDb = new sqlite3.Database(logsDbPath);
 const playlistDb = new sqlite3.Database(playlistDbPath);
+
+for (const db of [logsDb, playlistDb]) {
+  db.exec(
+    "PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000; PRAGMA synchronous = NORMAL;",
+    (err) => {
+      if (err) console.error("Erro ao ativar WAL:", err.message);
+    },
+  );
+}
 
 // Carrega os schemas
 const playLogsSchema = fs.readFileSync(

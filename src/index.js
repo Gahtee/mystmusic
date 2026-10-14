@@ -10,7 +10,14 @@ const {
   TextInputStyle,
 } = require("discord.js");
 const { exec } = require("child_process");
-const { TOKEN, GUILDS, OWNER_IDS } = require("./config/env");
+const {
+  TOKEN,
+  GUILDS,
+  OWNER_IDS,
+  PREFIX,
+  PM2_NAME,
+  ENABLE_SLASH,
+} = require("./config/env");
 const {
   play,
   stop,
@@ -67,7 +74,9 @@ const client = new Client({
 });
 
 client.once("clientReady", () => {
-  console.log(`Bot online como ${client.user.tag}`);
+  console.log(
+    `Bot online como ${client.user.tag} (prefixo "${PREFIX}"${ENABLE_SLASH ? "" : ", slash OFF"})`,
+  );
   try {
     preloadSfxPcm();
   } catch (err) {
@@ -788,6 +797,30 @@ async function handleSlashCommand(interaction) {
 
 client.on("messageCreate", async (message) => {
   if (message.author.bot || !message.guild) return;
+  // ── Prefixo configurável (.env: PREFIX="!" ou ".") ────────────────────────
+  // Cada instância só responde ao SEU prefixo — assim dois bots podem rodar
+  // lado a lado dividindo o mesmo banco sem responder dobrado.
+  // Normaliza para a forma canônica "!" e o restante do roteador segue
+  // inalterado (menos diff, menos risco de quebrar comando).
+  if (!message.content.startsWith(PREFIX)) return;
+  const corpo = message.content.slice(PREFIX.length);
+  message.content = "!" + corpo;
+  // Textos de ajuda exibem "`!comando" — traduz para o prefixo real para o
+  // bot "." não ensinar "!" (que ele não escuta). Só toca em `!` após
+  // crase, então "música!" e afins passam intactos.
+  // NOTA: só message.reply é adaptado (objeto por mensagem). channel.send
+  // NÃO é adaptado — o objeto do canal é compartilhado no cache e o patch
+  // vazaria entre mensagens. O único send com exemplos é o !help (embed),
+  // traduzido explicitamente no handler.
+  const comPrefixo = (texto) =>
+    PREFIX === "!" ? texto : texto.split("`!").join("`" + PREFIX);
+  const replyOriginal = message.reply.bind(message);
+  message.reply = (conteudo) => {
+    if (typeof conteudo === "string") return replyOriginal(comPrefixo(conteudo));
+    if (conteudo && typeof conteudo === "object" && typeof conteudo.content === "string")
+      conteudo.content = comPrefixo(conteudo.content);
+    return replyOriginal(conteudo);
+  };
   // Aceita !playnow e !playnext (o código antigo só removia "!playnow",
   // então "!playnext <q>" chegava ao playNow com o prefixo junto).
   const playNowMatch = message.content.match(/^!play(?:now|next)\s*/);
@@ -847,7 +880,7 @@ client.on("messageCreate", async (message) => {
       parte += linha + "\n";
     }
     if (parte.trim()) await message.channel.send(parte.trimEnd());
-    return message.channel.send(rodape.trim());
+    return message.channel.send(comPrefixo(rodape.trim()));
   }
 
   // !playlists @usuario  →  lista as playlists de outro membro
@@ -1509,6 +1542,13 @@ client.on("messageCreate", async (message) => {
         text: "MystMusic • Use os botões do painel para controle rápido",
       });
 
+    // Traduz os exemplos "`!comando" do help para o prefixo real (bot ".").
+    if (PREFIX !== "!") {
+      for (const f of embed.data.fields || []) {
+        if (typeof f.value === "string")
+          f.value = comPrefixo(f.value);
+      }
+    }
     return message.channel.send({ embeds: [embed] });
   }
 
@@ -1519,7 +1559,9 @@ client.on("messageCreate", async (message) => {
     await message.reply("🔄 Reiniciando o bot...");
 
     setTimeout(() => {
-      exec("pm2 restart mystmusic", (error) => {
+      // PM2_NAME vem do .env: cada instância reinicia SÓ a si mesma
+      // (.env → mystmusic, .env.bot2 → mystmusic2).
+      exec(`pm2 restart ${PM2_NAME}`, (error) => {
         if (error) console.error("Erro ao reiniciar:", error);
       });
     }, 1000);
@@ -1592,6 +1634,17 @@ client.on("interactionCreate", async (interaction) => {
 
   // 1️⃣ PRIMEIRO: Tratamento dos Comandos em Barra (Slash Commands)
   if (interaction.isChatInputCommand()) {
+    // Modo 2 bots: o 2º roda com ENABLE_SLASH=0 e responde SÓ ao prefixo
+    // "." — não registre /slash para o app 2 (deploy só com o .env
+    // principal). Se algum comando vazar, avisa em vez de falhar em silêncio.
+    if (!ENABLE_SLASH) {
+      return interaction
+        .reply({
+          content: `❌ Slash desativado neste bot — use os comandos de texto com \`${PREFIX}\` (ex: \`${PREFIX}play <música>\`).`,
+          ephemeral: true,
+        })
+        .catch(() => {});
+    }
     try {
       await handleSlashCommand(interaction);
     } catch (error) {
@@ -1611,6 +1664,13 @@ client.on("interactionCreate", async (interaction) => {
 
   // 2️⃣ SEGUNDO: Se não for comando em barra, só restam Botões e Modais
   if (!interaction.isButton() && !interaction.isModalSubmit()) return;
+
+  // Modo 2 bots: cada instância só atende botões/modais das SUAS mensagens.
+  // Sem isso, o bot 2 responderia "nenhuma atividade" ao clicarem no painel
+  // do bot 1 (o state é por processo). Compara o autor da mensagem do painel
+  // com o próprio user — interação sem mensagem passa (não é o nosso caso).
+  const autorPainel = interaction.message?.author?.id;
+  if (autorPainel && autorPainel !== client.user.id) return;
 
   const guildId = interaction.guild.id;
   const state = states.get(guildId);

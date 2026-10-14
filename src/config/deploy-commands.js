@@ -1,8 +1,19 @@
 const { REST, Routes, SlashCommandBuilder } = require("discord.js");
-const { TOKEN, CLIENT, GUILDS } = require("./env");
+const { TOKEN, CLIENT, GUILDS, PREFIX, ENABLE_SLASH } = require("./env");
 
 if (!TOKEN || !CLIENT) {
   console.error("❌ TOKEN ou CLIENT ausentes no .env — abortando deploy.");
+  process.exit(1);
+}
+
+// Modo 2 bots: o 2º (PREFIX=".", ENABLE_SLASH=0) responde só ao prefixo de
+// texto — registrar /slash para ele criaria entradas duplicadas (/play do
+// bot 1 + /play do bot 2). Rode o deploy SÓ com o .env principal.
+if (!ENABLE_SLASH) {
+  console.error(
+    `❌ ENABLE_SLASH=0 neste env (prefixo "${PREFIX}") — deploy de /slash abortado de propósito.\n` +
+      "   Rode sem DOTENV_FILE (usa o .env principal) para registrar os /slash uma única vez.",
+  );
   process.exit(1);
 }
 

@@ -32,10 +32,19 @@ function potArgs() {
   return [
     "--extractor-args",
     `youtube:player-client=mweb,tv,web_safari;youtubepot-bgutilhttp:base_url=${POT_BASE_URL}`,
+    // Streaming longo (sets de 2h): transient "Connection reset by peer" no
+    // meio do pipe matava a faixa. Retries altos + backoff exponencial +
+    // socket-timeout para o yt-dlp insistir antes de desistir.
     "--retries",
-    "3",
+    "10",
     "--fragment-retries",
-    "3",
+    "10",
+    "--retry-sleep",
+    "http:exp=1:10",
+    "--retry-sleep",
+    "fragment:exp=1:10",
+    "--socket-timeout",
+    "30",
     "--sleep-requests",
     "1",
   ];

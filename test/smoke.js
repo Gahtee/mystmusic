@@ -724,6 +724,49 @@ async function main() {
     assert.ok(idx.includes("!nightcore"), "!nightcore ausente");
   });
 
+  await check("dual-bot: PREFIX/PM2_NAME/ENABLE_SLASH + WAL + guards", () => {
+    const fs = require("fs");
+    const env = fs.readFileSync("src/config/env.js", "utf8");
+    assert.ok(env.includes("PREFIX"), "PREFIX ausente no env.js");
+    assert.ok(env.includes("PM2_NAME"), "PM2_NAME ausente no env.js");
+    assert.ok(env.includes("ENABLE_SLASH"), "ENABLE_SLASH ausente no env.js");
+    const sqlite = fs.readFileSync("src/config/sqlite.js", "utf8");
+    assert.ok(/journal_mode\s*=\s*WAL/i.test(sqlite), "WAL ausente no sqlite.js");
+    assert.ok(/busy_timeout/i.test(sqlite), "busy_timeout ausente no sqlite.js");
+    const idx = fs.readFileSync("src/index.js", "utf8");
+    assert.ok(idx.includes("startsWith(PREFIX)"), "gate de prefixo ausente");
+    assert.ok(idx.includes("!ENABLE_SLASH"), "gate de slash ausente");
+    assert.ok(idx.includes("PM2_NAME"), "restart por nome ausente");
+    assert.ok(
+      idx.includes("interaction.message?.author?.id"),
+      "filtro de botões por autor ausente",
+    );
+    const deploy = fs.readFileSync("src/config/deploy-commands.js", "utf8");
+    assert.ok(deploy.includes("ENABLE_SLASH"), "trava de deploy ausente");
+    assert.ok(fs.existsSync(".env.bot2.example"), ".env.bot2.example ausente");
+    assert.ok(fs.existsSync("ecosystem.config.js"), "ecosystem.config.js ausente");
+  });
+
+  await check("reconnect: detector de queda prematura + retry yt-dlp", () => {
+    const fs = require("fs");
+    const resolver = fs.readFileSync("src/music/resolver.js", "utf8");
+    assert.ok(resolver.includes('"--retries"'), "retries ausente no potArgs");
+    assert.ok(resolver.includes('"10"'), "retries 10 ausente");
+    assert.ok(resolver.includes("--retry-sleep"), "retry-sleep ausente");
+    assert.ok(resolver.includes("--socket-timeout"), "socket-timeout ausente");
+    const mgr = fs.readFileSync("src/music/manager.js", "utf8");
+    assert.ok(mgr.includes("MAX_RECONNECTS"), "MAX_RECONNECTS ausente");
+    assert.ok(mgr.includes("_stopIntencional"), "_stopIntencional ausente");
+    assert.ok(mgr.includes("_reconnectAttempts"), "_reconnectAttempts ausente");
+    assert.ok(mgr.includes("quedaPrematura"), "detector de queda ausente");
+    assert.ok(mgr.includes("retomando de onde parou"), "aviso de retomada ausente");
+    // skip/restart marcam parada intencional (senão o detector re-tocaria)
+    const skipIdx = mgr.indexOf("function skip(");
+    assert.ok(
+      mgr.slice(skipIdx, skipIdx + 500).includes("_stopIntencional = true"),
+      "skip sem marca intencional",
+    );
+  });
   await check("painel clamp elapsed e flags autoplay/loop", () => {
     // Elapsed maior que a duração (drift do relógio) — não pode mostrar 4:10 / 4:05.
     const painel = manager.criarPainelMusical(

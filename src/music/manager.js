@@ -31,6 +31,19 @@ const states = new Map();
 
 // Limites anti-spam: evitam N yt-dlp em paralelo e fila infinita.
 const MAX_QUEUE = 100;
+// Reconexão automática: se o stream morrer longe do fim da faixa (ex:
+// YouTube resetando a conexão em set de 2h), retoma do ponto onde parou
+// em vez de avançarcalar. Teto de tentativas para não girar infinito num
+// stream deterministicamente quebrado.
+const MAX_RECONNECTS = 3;
+// Fim "natural" = tocou até (duração − graça). Abaixo disso = prematuro.
+const RECONNECT_GRACE_SEC = 15;
+// Ao retomar, volta alguns segundos para não cortar sílaba/palavra.
+const RECONNECT_BACKTRACK_SEC = 5;
+// Sem duração conhecida (live/não resolvida): só considera prematuro se já
+// tocava há um tempo (falha rápida = stream quebrado → avança em vez de
+// insistir no mesmo ponto).
+const RECONNECT_MIN_ELAPSED_DESCONHECIDO_SEC = 30;
 // Intervalo de atualização da barra de progresso (30s p/ evitar rate-limit).
 const PROGRESS_EDIT_INTERVAL_MS = 30_000;
 const PROGRESS_INITIAL_DELAY_MS = 10_000;
@@ -428,6 +441,10 @@ function iniciarReproducao(
   // Mata o stream anterior antes de criar o novo — sem isso cada skip/seek
   // deixava um yt-dlp (+ffmpeg) orfao consumindo banda/CPU.
   pararStreamAtual(state);
+  // Troca real de faixa/posição: zera o contador de reconexões. A retomada
+  // automática seta _retomadaAuto antes de chamar (contador preservado).
+  if (!state._retomadaAuto) state._reconnectAttempts = 0;
+  state._retomadaAuto = false;
 
   // Ajusta o relogio interno para que o timer reflita a posicao real na faixa.
   // Com nightcore, o audio anda rate x mais rapido que o relogio: escala o
@@ -471,6 +488,9 @@ function iniciarFaixaOtimista(
   const streamTarget =
     song.url || (isQueryUrl ? query : `${searchEngine}1:${query}`);
   pararStreamAtual(state);
+  // Faixa nova (não retomada): zera reconexões (ver iniciarReproducao).
+  state._reconnectAttempts = 0;
+  state._retomadaAuto = false;
 
   // Pipeline PCM: nao ha mais passthrough WebmOpus — tudo passa pelo mixer
   // (decode PCM + encode Opus via opusscript, ~10x realtime no Pi). Sem
@@ -758,6 +778,71 @@ async function play(message, query, searchEngine = "ytsearch") {
     async function processarIdle(guildId) {
       const currentState = states.get(guildId);
       if (!currentState) return;
+
+      // ── Reconexão automática (queda de stream no meio da faixa) ──────────
+      // Pipeline: yt-dlp -> ffmpeg -> mixer -> player. Se o YouTube reseta a
+      // conexão (sets longos), o pipe fecha, o mixer encerra e o player cai
+      // em idle — que aqui parecia "fim de faixa" e avançava/calava.
+      // Critério: idle NÃO intencional + faixa morreu longe do fim
+      // (elapsed < duração − graça). Sem duração conhecida, exige um mínimo
+      // de tempo tocado (falha rápida = stream quebrado, avança em vez de
+      // insistir no mesmo ponto). Retoma do ponto onde parou (− backtrack).
+      if (!currentState._stopIntencional && currentState.current) {
+        const elapsedSec = Math.floor(calcularElapsedMs(currentState) / 1000);
+        const dur = duracaoEfetiva(currentState.current, currentState);
+        const quedaPrematura = dur
+          ? elapsedSec < dur - RECONNECT_GRACE_SEC
+          : elapsedSec >= RECONNECT_MIN_ELAPSED_DESCONHECIDO_SEC;
+        if (quedaPrematura) {
+          const tentativas = currentState._reconnectAttempts || 0;
+          if (tentativas < MAX_RECONNECTS) {
+            currentState._reconnectAttempts = tentativas + 1;
+            const retomarDe = Math.max(
+              0,
+              elapsedSec - RECONNECT_BACKTRACK_SEC,
+            );
+            const mm = Math.floor(retomarDe / 60);
+            const ss = String(retomarDe % 60).padStart(2, "0");
+            console.warn(
+              `🔄 Stream caiu aos ${mm}:${ss} ("${currentState.current.title}") — retomando (tentativa ${tentativas + 1}/${MAX_RECONNECTS}).`,
+            );
+            if (currentState.textChannel) {
+              currentState.textChannel
+                .send(
+                  `🔄 A conexão caiu aos **${mm}:${ss}** — retomando de onde parou...`,
+                )
+                .catch(() => {});
+            }
+            // Retoma o stream do ponto onde parou. transitioning ainda não
+            // foi setado neste idle (é setado abaixo), então a retomada
+            // segue direto — o próximo idle passa pelo detector de novo.
+            const song = currentState.current;
+            const rate =
+              (currentState.pcmMixer && currentState.pcmMixer.playbackRate) ||
+              1;
+            currentState._retomadaAuto = true;
+            iniciarReproducao(currentState, song, true, Math.floor(retomarDe / rate));
+            // Reancora o relógio na posição audível (não na fonte).
+            currentState.playbackStartedAt = Date.now() - retomarDe * 1000;
+            if (currentState.textChannel) {
+              await enviarNovoPainel(
+                currentState.textChannel,
+                currentState,
+                song,
+              ).catch(() => {});
+            }
+            return;
+          }
+          console.warn(
+            `⚠️ Stream caiu ${MAX_RECONNECTS}x — desistindo de "${currentState.current.title}", avançando.`,
+          );
+          currentState._reconnectAttempts = 0;
+        } else {
+          // Fim natural: zera o contador para a próxima faixa.
+          currentState._reconnectAttempts = 0;
+        }
+      }
+      currentState._stopIntencional = false;
 
       // (b1): transição já em andamento — ignora a duplicada.
       if (currentState.transitioning) {
@@ -1341,6 +1426,8 @@ function skip(guildId) {
   // Mata o timer de restauração do SFX: a próxima faixa assume o player e o
   // callback de restore não pode tocar no stream novo (ver guarda de URL lá).
   limparTimerSfx(state);
+  // Pulo intencional: o idle seguinte NÃO é queda de stream (ver processarIdle).
+  state._stopIntencional = true;
   // O stream antigo é morto dentro de iniciarReproducao quando a próxima
   // faixa começa; o player.stop() aqui dispara o stateChange -> idle.
   state.player.stop();
@@ -1416,6 +1503,7 @@ function restart(guildId) {
   const state = states.get(guildId);
   if (!state || !state.current) return false;
   limparTimerSfx(state);
+  state._stopIntencional = true;
   state.queue.unshift(state.current);
   state.player.stop();
   return true;
