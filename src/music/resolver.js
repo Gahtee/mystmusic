@@ -256,7 +256,41 @@ async function getAudioMetadata(query, searchEngine = "ytsearch") {
   return meta;
 }
 
-async function getPlaylistMetadata(playlistUrl) {
+// Limites de extração (--playlist-end): rádio é "infinita" (Mix gerado na
+// hora) — sem teto baixo o yt-dlp tenta paginar sem fim e pode estourar
+// tempo/memória. Playlist (YouTube/YouTube Music/SoundCloud) busca tudo com
+// failsafe de 500.
+const PLAYLIST_FETCH_MAX = 500;
+const RADIO_FETCH_MAX = 50;
+
+// Extrai o valor bruto do parâmetro `list=` de uma URL (preserva o case do
+// valor — IDs de rádio começam com "RD" maiúsculo).
+function getListParam(url) {
+  if (!url || typeof url !== "string") return null;
+  try {
+    const u = new URL(url);
+    const v = u.searchParams.get("list");
+    if (v) return v;
+  } catch (err) {
+    // URL relativa/inválida — cai no regex abaixo.
+  }
+  const m = String(url).match(/[?&]list=([^&#]+)/i);
+  return m ? m[1] : null;
+}
+
+// Rádio = Mix gerado: watch?v=X&list=RDX (YouTube e YouTube Music usam o
+// mesmo esquema list=RD...). Playlist normal usa PL*/OLAK*/etc.
+function isRadioUrl(url) {
+  const list = getListParam(url);
+  return !!list && list.startsWith("RD");
+}
+
+async function getPlaylistMetadata(playlistUrl, limitOverride) {
+  const autoLimit = isRadioUrl(playlistUrl) ? RADIO_FETCH_MAX : PLAYLIST_FETCH_MAX;
+  const limit =
+    Number.isInteger(limitOverride) && limitOverride > 0
+      ? limitOverride
+      : autoLimit;
   const args = [
     ...cookieArgs(),
     ...potArgs(),
@@ -264,7 +298,7 @@ async function getPlaylistMetadata(playlistUrl) {
     "node",
     "--flat-playlist",
     "--playlist-end",
-    "100",
+    String(limit),
     "--dump-single-json",
     "--no-warnings",
     playlistUrl,
@@ -309,9 +343,16 @@ async function getPlaylistMetadata(playlistUrl) {
     // quebrariam o stream depois.
     .filter((s) => typeof s.url === "string" && s.url.length > 0);
 
+  // kind permite ao manager dar feedback ("Rádio" vs "Playlist").
+  // truncated = true quando o yt-dlp bateu no --playlist-end (pode haver mais).
+  const isRadio = isRadioUrl(playlistUrl);
   return {
     playlistTitle: playlistData.title,
     songs,
+    kind: isRadio ? "radio" : "playlist",
+    isRadio,
+    limit,
+    truncated: entries.length >= limit,
   };
 }
 
@@ -491,5 +532,9 @@ module.exports = {
   getPlaylistMetadata,
   killStreamProcesses,
   normalizeMetadata,
+  isRadioUrl,
+  getListParam,
+  PLAYLIST_FETCH_MAX,
+  RADIO_FETCH_MAX,
   _cache: { get: cacheGet, set: cacheSet, clear: () => metadataCache.clear() },
 };

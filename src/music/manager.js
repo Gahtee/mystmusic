@@ -19,6 +19,9 @@ const {
   getPcmStreamWithSeek,
   getPlaylistMetadata,
   killStreamProcesses,
+  isRadioUrl,
+  PLAYLIST_FETCH_MAX,
+  RADIO_FETCH_MAX,
 } = require("./resolver");
 const { PcmMixer } = require("./pcmMixer");
 const {
@@ -30,7 +33,9 @@ const { logsDb, playlistDb } = require("../config/sqlite");
 const states = new Map();
 
 // Limites anti-spam: evitam N yt-dlp em paralelo e fila infinita.
-const MAX_QUEUE = 100;
+// Fila comporta o failsafe máximo de playlist (500). Rádio tem teto próprio
+// menor (50) aplicado na extração — ver resolver RADIO_FETCH_MAX.
+const MAX_QUEUE = 500;
 // Reconexão automática: se o stream morrer longe do fim da faixa (ex:
 // YouTube resetando a conexão em set de 2h), retoma do ponto onde parou
 // em vez de avançarcalar. Teto de tentativas para não girar infinito num
@@ -624,8 +629,11 @@ function isPlaylistUrl(query) {
 // Coleção Spotify já convertida (play() de coleção delega para cá).
 // 1ª faixa via play() normal (cria conexão + state), resto enfileirado direto.
 // Fora do play() para não capturar o state antigo no closure.
+// Failsafe: coleção capada em PLAYLIST_FETCH_MAX (álbuns grandes/artistas
+// com discografia extensa não estouram a fila).
 async function playSpotifyCollection(message, conv, searchEngine = "ytsearch") {
-  const [primeira, ...resto] = conv.songs || [];
+  const todas = (conv.songs || []).slice(0, PLAYLIST_FETCH_MAX);
+  const [primeira, ...resto] = todas;
   if (!primeira) {
     return message.reply("❌ Essa coleção do Spotify está vazia.");
   }
@@ -642,9 +650,13 @@ async function playSpotifyCollection(message, conv, searchEngine = "ytsearch") {
     state.queue.push(song);
   });
   if (paraAdicionar.length > 0) {
+    const avisoFailsafe =
+      (conv.songs || []).length > todas.length
+        ? ` (⚠️ failsafe: limite de ${PLAYLIST_FETCH_MAX} faixas)`
+        : "";
     message
       .reply(
-        `✅ Mais **${paraAdicionar.length} músicas** da playlist **"${conv.playlistTitle}"** foram adicionadas à fila!`,
+        `✅ Mais **${paraAdicionar.length} músicas** da playlist **"${conv.playlistTitle}"** foram adicionadas à fila!${avisoFailsafe}`,
       )
       .catch(() => {});
     prefetchProxima(state);
@@ -1064,14 +1076,22 @@ async function play(message, query, searchEngine = "ytsearch") {
   // Anti-spam: barra novas adições quando a fila já está cheia.
   const filaCheia = () => state.queue.length >= MAX_QUEUE;
 
-  // Enfileira faixas já convertidas (playlist do YouTube OU coleção Spotify).
+  // Enfileira faixas já convertidas (playlist/rádio do YouTube OU coleção Spotify).
   // Extraído para reuso pelo fluxo Spotify — mesma lógica, mesma UX.
-  async function enfileirarFaixas(playlistTitle, songs) {
+  // info: { kind, isRadio, limit, truncated } vindo do resolver (para feedback
+  // "Rádio (50)" vs "Playlist (failsafe 500)").
+  async function enfileirarFaixas(playlistTitle, songs, info = {}) {
     if (!songs || songs.length === 0) {
       return message.reply(
         "❌ Não encontrei nenhuma música válida nessa playlist.",
       );
     }
+    const ehRadio = info.kind === "radio" || info.isRadio === true;
+    const rotulo = ehRadio ? "rádio" : "playlist";
+    const teto = ehRadio ? RADIO_FETCH_MAX : PLAYLIST_FETCH_MAX;
+    // Failsafe: nunca enfileira além do teto de extração (rádio 50 / playlist
+    // 500). A fila em si comporta MAX_QUEUE (=500), então playlist cheia cabe
+    // inteira; rádio passa longe do teto da fila.
 
     const espacoLivre = Math.max(0, MAX_QUEUE - state.queue.length);
     if (espacoLivre <= 0) {
@@ -1094,9 +1114,13 @@ async function play(message, query, searchEngine = "ytsearch") {
     const avisoLimite =
       songs.length > paraAdicionar.length
         ? ` (limite de ${MAX_QUEUE} — ${songs.length - paraAdicionar.length} ficaram de fora)`
-        : "";
+        : !ehRadio && info.truncated
+          ? ` (⚠️ failsafe: peguei as primeiras ${teto} — a playlist original tem mais)`
+          : ehRadio && paraAdicionar.length >= teto
+            ? ` (📻 rádio: mix contínuo — peguei as primeiras ${teto})`
+            : "";
     message.reply(
-      `✅ **${paraAdicionar.length} músicas** da playlist **"${playlistTitle}"** foram adicionadas à fila!${avisoLimite}`,
+      `✅ **${paraAdicionar.length} músicas** da ${rotulo} **"${playlistTitle}"** foram adicionadas à fila!${avisoLimite}`,
     );
 
     if (state.queue.length === paraAdicionar.length) {
@@ -1141,11 +1165,19 @@ async function play(message, query, searchEngine = "ytsearch") {
   try {
     if (isPlaylist) {
       message.reply(
-        "🔍 Processando playlist... Isso pode levar alguns segundos.",
+        isRadioUrl(query)
+          ? "🔍 Processando rádio... pegando as primeiras 50 (mix contínuo)."
+          : "🔍 Processando playlist... Isso pode levar alguns segundos.",
       );
 
-      const { playlistTitle, songs } = await metadataPromise;
-      await enfileirarFaixas(playlistTitle, songs);
+      const { playlistTitle, songs, kind, isRadio, limit, truncated } =
+        await metadataPromise;
+      await enfileirarFaixas(playlistTitle, songs, {
+        kind,
+        isRadio,
+        limit,
+        truncated,
+      });
     } else {
       if (filaCheia()) {
         return message.reply(
@@ -1279,7 +1311,13 @@ async function playNow(message, query) {
         return message.reply(err.message || "❌ Não consegui ler esse link do Spotify.");
       }
       if (sp.kind === "collection") {
-        const conv = spotifyCollectionAsPlaylist(sp);
+        const base = spotifyCollectionAsPlaylist(sp);
+        const todas = (base.songs || []).slice(0, PLAYLIST_FETCH_MAX);
+        const conv = {
+          playlistTitle: base.playlistTitle,
+          songs: todas,
+          totalOriginal: (base.songs || []).length,
+        };
         message.reply(
           "🔍 Processando fura-fila de playlist... Isso pode levar alguns segundos.",
         );
@@ -1297,17 +1335,25 @@ async function playNow(message, query) {
             state.queue.splice(1, 0, song);
           }
         });
+        const avisoFailsafe =
+          conv.totalOriginal > conv.songs.length
+            ? ` (⚠️ failsafe: limite de ${PLAYLIST_FETCH_MAX} faixas)`
+            : "";
         return message.reply(
-          `⚡ **Fura-Fila:** **${paraAdicionar.length} músicas** da playlist **"${conv.playlistTitle}"** foram colocadas no topo da fila!`,
+          `⚡ **Fura-Fila:** **${paraAdicionar.length} músicas** da playlist **"${conv.playlistTitle}"** foram colocadas no topo da fila!${avisoFailsafe}`,
         );
       }
       query = sp.query;
     }
     if (isPlaylistUrl(query)) {
+      const ehRadio = isRadioUrl(query);
       message.reply(
-        "🔍 Processando fura-fila de playlist... Isso pode levar alguns segundos.",
+        ehRadio
+          ? "🔍 Processando fura-fila de rádio... pegando as primeiras 50."
+          : "🔍 Processando fura-fila de playlist... Isso pode levar alguns segundos.",
       );
-      const { playlistTitle, songs } = await getPlaylistMetadata(query);
+      const { playlistTitle, songs, kind, isRadio, limit, truncated } =
+        await getPlaylistMetadata(query);
 
       if (!songs || songs.length === 0) {
         return message.reply(
@@ -1333,12 +1379,19 @@ async function playNow(message, query) {
         }
       });
 
+      const ehRadioInner = kind === "radio" || isRadio === true;
+      const rotuloInner = ehRadioInner ? "rádio" : "playlist";
+      const tetoInner = ehRadioInner ? RADIO_FETCH_MAX : PLAYLIST_FETCH_MAX;
       const avisoLimite =
         songs.length > paraAdicionar.length
           ? ` (limite de ${MAX_QUEUE} — ${songs.length - paraAdicionar.length} ficaram de fora)`
-          : "";
+          : !ehRadioInner && truncated
+            ? ` (⚠️ failsafe: peguei as primeiras ${tetoInner} — a playlist original tem mais)`
+            : ehRadioInner && paraAdicionar.length >= tetoInner
+              ? ` (📻 rádio: mix contínuo — peguei as primeiras ${tetoInner})`
+              : "";
       message.reply(
-        `⚡ **Fura-Fila:** **${paraAdicionar.length} músicas** da playlist **"${playlistTitle}"** foram colocadas no topo da fila!${avisoLimite}`,
+        `⚡ **Fura-Fila:** **${paraAdicionar.length} músicas** da ${rotuloInner} **"${playlistTitle}"** foram colocadas no topo da fila!${avisoLimite}`,
       );
     } else {
       if (state.queue.length >= MAX_QUEUE) {

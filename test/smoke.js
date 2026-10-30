@@ -100,7 +100,7 @@ async function main() {
       "function",
       "killStreamProcesses não exportado do resolver",
     );
-    assert.strictEqual(manager.MAX_QUEUE, 100, "MAX_QUEUE inesperado");
+    assert.strictEqual(manager.MAX_QUEUE, 500, "MAX_QUEUE inesperado");
   });
 
   await check("parseSeekInput", () => {
@@ -843,6 +843,34 @@ async function main() {
     const dt = Date.now() - t;
     assert.strictEqual(meta.title, "Cached");
     assert.ok(dt < 1000, `cache lento: ${dt}ms (era para ser ~0ms)`);
+  });
+
+  await check("radio vs playlist: isRadioUrl + limites 50/500", () => {
+    const resolver = require("../src/music/resolver.js");
+    assert.strictEqual(typeof resolver.isRadioUrl, "function");
+    assert.strictEqual(typeof resolver.getListParam, "function");
+    assert.strictEqual(resolver.RADIO_FETCH_MAX, 50);
+    assert.strictEqual(resolver.PLAYLIST_FETCH_MAX, 500);
+    // Mix/rádio: list=RD... (YouTube e YouTube Music usam o mesmo esquema)
+    assert.strictEqual(
+      resolver.isRadioUrl("https://www.youtube.com/watch?v=aqz-KE-bpKQ&list=RDaqz-KE-bpKQ"),
+      true,
+    );
+    assert.strictEqual(
+      resolver.isRadioUrl("https://music.youtube.com/watch?v=xyz123abc45&list=RDxyz123abc45"),
+      true,
+    );
+    // Playlist normal: PL*/OLAK* não é rádio
+    assert.strictEqual(
+      resolver.isRadioUrl("https://www.youtube.com/playlist?list=PL1234567890abcdef"),
+      false,
+    );
+    assert.strictEqual(
+      resolver.isRadioUrl("https://music.youtube.com/playlist?list=OLAK5uy_test123"),
+      false,
+    );
+    assert.strictEqual(resolver.isRadioUrl("judas lady gaga"), false);
+    assert.strictEqual(resolver.getListParam("sem-list"), null);
   });
 
   await check("normalizeMetadata desembrulha ytsearch wrapper", () => {
