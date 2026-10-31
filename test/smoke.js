@@ -242,7 +242,7 @@ async function main() {
   });
 
   await check("slash: handlers cobrem todos os comandos registrados", () => {
-    const src = require("fs").readFileSync("src/index.js", "utf8");
+    const src = require("fs").readFileSync("src/routes/slash.js", "utf8");
     for (const nome of [
       "play",
       "playsc",
@@ -717,11 +717,12 @@ async function main() {
     const deploy = fs.readFileSync("src/config/deploy-commands.js", "utf8");
     assert.ok(deploy.includes('setName("bass")'), "/bass ausente no deploy");
     assert.ok(deploy.includes('setName("nightcore")'), "/nightcore ausente no deploy");
-    const idx = fs.readFileSync("src/index.js", "utf8");
+    const idx = fs.readFileSync("src/routes/slash.js", "utf8");
     assert.ok(idx.includes('case "bass"'), "handler /bass ausente");
     assert.ok(idx.includes('case "nightcore"'), "handler /nightcore ausente");
-    assert.ok(idx.includes("!bass"), "!bass ausente");
-    assert.ok(idx.includes("!nightcore"), "!nightcore ausente");
+    const idxPrefixo = fs.readFileSync("src/index.js", "utf8");
+    assert.ok(idxPrefixo.includes("!bass"), "!bass ausente");
+    assert.ok(idxPrefixo.includes("!nightcore"), "!nightcore ausente");
   });
 
   await check("dual-bot: PREFIX/PM2_NAME/ENABLE_SLASH + WAL + guards", () => {
