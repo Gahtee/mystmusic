@@ -22,16 +22,12 @@ function cookieArgs() {
 const YTDLP_TIMEOUT_MS = 60_000;
 const YTDLP_MAX_BUFFER = 1024 * 1024 * 20;
 
-// PO Token via bgutil provider local (docker em 127.0.0.1:4416).
-// Mitiga HTTP 403 / "Sign in to confirm you're not a bot" em IP de datacenter.
-// Clientes mweb,tv,web_safari disparam o fluxo POT; se o servidor local cair,
-// o yt-dlp segue sem token (não quebra a extração).
-const POT_BASE_URL = process.env.POT_BASE_URL || "http://127.0.0.1:4416";
-
+// 31/10: sem player-client forcado. O path mweb,tv,web_safari+bgutil estava
+// gerando POT rejeitado no googlevideo (403 em todo download, metadado OK).
+// O default do yt-dlp (web embedded + tv downgraded + jsc:node) baixa 251
+// sem 403 (validado A/B no mystmusic2). Mantidos retries/timeout p/ sets longos.
 function potArgs() {
   return [
-    "--extractor-args",
-    `youtube:player-client=mweb,tv,web_safari;youtubepot-bgutilhttp:base_url=${POT_BASE_URL}`,
     // Streaming longo (sets de 2h): transient "Connection reset by peer" no
     // meio do pipe matava a faixa. Retries altos + backoff exponencial +
     // socket-timeout para o yt-dlp insistir antes de desistir.
