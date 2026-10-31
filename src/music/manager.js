@@ -6,12 +6,6 @@ const {
   StreamType,
   NoSubscriberBehavior,
 } = require("@discordjs/voice");
-const {
-  EmbedBuilder,
-  ActionRowBuilder,
-  ButtonBuilder,
-  ButtonStyle,
-} = require("discord.js");
 const { playStream } = require("./player");
 const {
   getAudioMetadata,
@@ -30,6 +24,9 @@ const {
   spotifyCollectionAsPlaylist,
 } = require("./spotify");
 const { logsDb, playlistDb } = require("../config/sqlite");
+const { parseSeekInput } = require("../utils/format");
+const { extrairYoutubeId, isPlaylistUrl } = require("../utils/urls");
+const { criarPainelMusical } = require("../utils/paineis");
 const states = new Map();
 
 // Limites anti-spam: evitam N yt-dlp em paralelo e fila infinita.
@@ -69,21 +66,6 @@ function savePlayLog(
       if (err) console.error("Falha ao salvar play_log:", err.message);
     },
   );
-}
-
-function formatarTempo(segundos) {
-  if (segundos === null || segundos === undefined || !Number.isFinite(segundos))
-    return "--:--";
-  const m = Math.floor(segundos / 60);
-  const s = Math.floor(segundos % 60);
-  return `${m}:${s.toString().padStart(2, "0")}`;
-}
-
-function criarBarraProgresso(elapsedSec, totalSec, tamanho = 20) {
-  if (!totalSec || totalSec <= 0) return "▬".repeat(tamanho);
-  const proporcao = Math.max(0, Math.min(elapsedSec / totalSec, 1));
-  const posicao = Math.min(tamanho - 1, Math.round(proporcao * (tamanho - 1)));
-  return "▬".repeat(posicao) + "🔵" + "▬".repeat(tamanho - posicao - 1);
 }
 
 // Quanto tempo (ms) já tocou da faixa atual, descontando o tempo pausado.
@@ -227,96 +209,6 @@ function rebalancearRelogio(state, taxaAntiga) {
     agora - (state.totalPausedMs || 0) - posicaoAudivel / nova;
 }
 
-// Extrai o ID de 11 caracteres de uma URL do YouTube (watch?v= ou youtu.be/), usado
-// pelo autoplay para montar a playlist "Mix" (relacionados) a partir da faixa atual.
-function extrairYoutubeId(url) {
-  if (!url) return null;
-  const match = url.match(/(?:v=|youtu\.be\/)([a-zA-Z0-9_-]{11})/);
-  return match ? match[1] : null;
-}
-
-function criarPainelMusical(metadata, elapsedSec = 0, flags = {}) {
-  const titulo = metadata.title || "🔍 Buscando dados da faixa...";
-  const url = metadata.url || null;
-  const descricaoTitulo = url ? `**[${titulo}](${url})**` : `**${titulo}**`;
-  // Com nightcore a faixa acaba rate x mais cedo: a barra usa a duração
-  // EFETIVA (flags.duracaoEfetiva, calculada pelo chamador com o state).
-  // Fallback p/ duration crua quando o chamador não informa (testes, np sem state).
-  const durTotal = flags.duracaoEfetiva || metadata.duration;
-  // Clamp: o relógio é Date.now() e o Discord atrasa/adianta o áudio real —
-  // sem isso o painel mostra "4:10 / 4:05".
-  const elapsedSafe = Math.max(0, Math.floor(elapsedSec) || 0);
-  const elapsed = durTotal ? Math.min(elapsedSafe, Math.floor(durTotal)) : elapsedSafe;
-  const barra = durTotal
-    ? `${criarBarraProgresso(elapsed, durTotal)}\n\`${formatarTempo(elapsed)} / ${formatarTempo(durTotal)}\``
-    : "🔍 *Carregando informações...*";
-  const pedidoPor = metadata.requestedBy
-    ? `<@${metadata.requestedBy}>`
-    : "📻 Autoplay";
-  const statusExtras = [
-    flags.autoplay ? "📻 Autoplay ON" : null,
-    flags.loop ? "🔂 Loop ON" : null,
-    flags.bassDb > 0 ? `🔊 Bass +${formatarFx(flags.bassDb)}dB` : null,
-    flags.nightcore !== undefined && flags.nightcore !== 1
-      ? `⚡ ${formatarFx(flags.nightcore)}x`
-      : null,
-  ]
-    .filter(Boolean)
-    .join(" • ");
-  const rodape = statusExtras
-    ? `MystMusic • ${statusExtras}`
-    : "MystMusic • Controle pelos botões abaixo";
-
-  const embed = new EmbedBuilder()
-    .setColor("#5865F2")
-    .setTitle("🎶 Tocando Agora")
-    .setDescription(`${descricaoTitulo}\n${barra}`)
-    .setThumbnail(metadata.thumbnail || null)
-    .addFields(
-      {
-        name: "📺 Canal",
-        value: String(metadata.uploader || "Desconhecido").slice(0, 256),
-        inline: true,
-      },
-      { name: "👤 Pedido por", value: pedidoPor, inline: true },
-    )
-    .setFooter({ text: rodape });
-  const row1 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId("btn_restart")
-      .setLabel("🔄")
-      .setStyle(ButtonStyle.Primary),
-    new ButtonBuilder()
-      .setCustomId("btn_stop")
-      .setLabel("⏹️")
-      .setStyle(ButtonStyle.Danger),
-    new ButtonBuilder()
-      .setCustomId("btn_skip")
-      .setLabel("⏭️")
-      .setStyle(ButtonStyle.Primary),
-    new ButtonBuilder()
-      .setCustomId("btn_shuffle")
-      .setLabel("🔀")
-      .setStyle(ButtonStyle.Primary),
-    new ButtonBuilder()
-      .setCustomId("btn_like")
-      .setLabel("❤️ Curtir")
-      .setStyle(ButtonStyle.Secondary),
-  );
-  const row2 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId("btn_pauseresume")
-      .setLabel("⏯️ Pausar/Retomar")
-      .setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder()
-      .setCustomId("btn_queue")
-      .setLabel("📋 Fila")
-      .setStyle(ButtonStyle.Secondary),
-  );
-
-  return { embeds: [embed], components: [row1, row2] };
-}
-
 function shuffleQueue(guildId) {
   const state = states.get(guildId);
   if (!state || state.queue.length <= 2) return false;
@@ -364,11 +256,6 @@ function pararStreamAtual(state) {
   if (!state.audioStream) return;
   killStreamProcesses(state.audioStream);
   state.audioStream = null;
-}
-
-// Formata número de FX sem zeros à toa (6 -> "6", 1.25 -> "1.25").
-function formatarFx(v) {
-  return String(Number(Number(v).toFixed(2)));
 }
 
 // Flags visuais do painel (autoplay/loop/fx) sem acoplar o state inteiro.
@@ -617,13 +504,6 @@ function filtrarRelacionadasNovas(state, candidatas) {
     const id = extrairYoutubeId(s?.url);
     return id && !vistos.has(id);
   });
-}
-
-// Detecta playlist tanto do YouTube (?list=...) quanto do SoundCloud (.../sets/...).
-function isPlaylistUrl(query) {
-  return (
-    query.includes("list=") || /soundcloud\.com\/[^/]+\/sets\//i.test(query)
-  );
 }
 
 // Coleção Spotify já convertida (play() de coleção delega para cá).
@@ -1977,47 +1857,6 @@ function listarPlaylistsDoServidor() {
       },
     );
   });
-}
-
-// Converte string de tempo para segundos.
-// Formatos aceitos:
-//   "15"         → 15 min (sem separador = minutos por convenção do bot)
-//   "1:30"       → 1 min 30 s   (MM:SS ou H:MM dependendo do contexto)
-//   "10:20"      → 10 min 20 s
-//   "1:12:14"    → 1 h 12 min 14 s
-//   "00:15"      → 15 s   (zero à esquerda indica segundos)
-//   "00:00:15"   → 15 s
-//
-// Regra para dois segmentos (A:B):
-//   Se A === 0  → resultado = B segundos  (ex: 00:15 → 15 s)
-//   Caso contrário → resultado = A*60 + B segundos (ex: 10:20 → 620 s)
-function parseSeekInput(input) {
-  input = input.trim();
-
-  // Sem ":" — número sozinho → minutos
-  if (!input.includes(":")) {
-    const n = parseInt(input, 10);
-    return isNaN(n) ? null : n * 60;
-  }
-
-  const partes = input.split(":").map((p) => parseInt(p, 10));
-  if (partes.some(isNaN)) return null;
-
-  if (partes.length === 3) {
-    // H:MM:SS
-    const [h, m, s] = partes;
-    return h * 3600 + m * 60 + s;
-  }
-
-  if (partes.length === 2) {
-    const [a, b] = partes;
-    // Se o primeiro segmento é 0 → só segundos (00:15 → 15 s)
-    if (a === 0) return b;
-    // Caso contrário → MM:SS
-    return a * 60 + b;
-  }
-
-  return null;
 }
 
 // Faz seek na música atual: reinicia o stream a partir de seekSec segundos.

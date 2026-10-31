@@ -63,6 +63,7 @@ const {
   preloadSfxPcm,
 } = require("./music/sfx");
 const { logsDb, playlistDb } = require("./config/sqlite");
+const { criarPainelFila } = require("./utils/paineis");
 
 const client = new Client({
   intents: [
@@ -89,69 +90,6 @@ client.once("clientReady", () => {
     }
   });
 });
-
-function criarPainelFila(state, pagina = 0) {
-  const { queue, current } = state;
-  const itensPorPagina = 10;
-  const totalPaginas = Math.ceil((queue.length - 1) / itensPorPagina);
-
-  const embed = new EmbedBuilder()
-    .setColor("#5865F2")
-    .setTitle("📋 Fila de Reprodução");
-
-  if (!current && queue.length === 0) {
-    embed.setDescription("A fila está completamente vazia.");
-    return { embeds: [embed], components: [] };
-  }
-  // Autoplay tem requestedBy null — evita renderizar <@null> / <@undefined>.
-  const rotuloPedido = (faixa) =>
-    faixa && faixa.requestedBy ? `<@${faixa.requestedBy}>` : "📻 Autoplay";
-  let descricao = `**Tocando Agora:**\n🔹 [${current.title}](${current.url}) | ${rotuloPedido(current)}\n\n`;
-
-  if (queue.length > 1) {
-    descricao += `**Próximas Músicas:**\n`;
-    const inicio = 1 + pagina * itensPorPagina;
-    const fim = Math.min(inicio + itensPorPagina, queue.length);
-
-    for (let i = inicio; i < fim; i++) {
-      descricao += `\`${i}.\` [${queue[i].title}](${queue[i].url}) | ${rotuloPedido(queue[i])}\n`;
-    }
-
-    embed.setFooter({
-      text: `Página ${pagina + 1} de ${totalPaginas || 1} • Total de ${queue.length - 1} músicas na fila`,
-    });
-  } else {
-    descricao += "_Não há mais músicas na fila._";
-    embed.setFooter({ text: "Nenhuma música na fila" });
-  }
-
-  embed.setDescription(descricao);
-
-  // Criação dos botões de paginação
-  const row = new ActionRowBuilder();
-
-  if (totalPaginas > 1) {
-    row.addComponents(
-      new ButtonBuilder()
-        .setCustomId(`queue_prev_${pagina}`)
-        .setLabel("◀️")
-        .setStyle(ButtonStyle.Secondary)
-        .setDisabled(pagina === 0),
-      new ButtonBuilder()
-        .setCustomId(`queue_goto_${pagina}_${totalPaginas}`)
-        .setLabel("🔢 Ir para...")
-        .setStyle(ButtonStyle.Primary),
-      new ButtonBuilder()
-        .setCustomId(`queue_next_${pagina}`)
-        .setLabel("▶️")
-        .setStyle(ButtonStyle.Secondary)
-        .setDisabled(pagina >= totalPaginas - 1),
-    );
-    return { embeds: [embed], components: [row] };
-  }
-
-  return { embeds: [embed], components: [] };
-}
 
 // ── Adaptador slash → prefixo ─────────────────────────────────────────────
 // Comandos de texto (!play, !skip, ...) recebem `message` (reply/channel/author
