@@ -720,7 +720,7 @@ async function main() {
     const idx = fs.readFileSync("src/routes/slash.js", "utf8");
     assert.ok(idx.includes('case "bass"'), "handler /bass ausente");
     assert.ok(idx.includes('case "nightcore"'), "handler /nightcore ausente");
-    const idxPrefixo = fs.readFileSync("src/index.js", "utf8");
+    const idxPrefixo = fs.readFileSync("src/routes/prefix.js", "utf8");
     assert.ok(idxPrefixo.includes("!bass"), "!bass ausente");
     assert.ok(idxPrefixo.includes("!nightcore"), "!nightcore ausente");
   });
@@ -737,7 +737,8 @@ async function main() {
     const idx = fs.readFileSync("src/index.js", "utf8");
     assert.ok(idx.includes("startsWith(PREFIX)"), "gate de prefixo ausente");
     assert.ok(idx.includes("!ENABLE_SLASH"), "gate de slash ausente");
-    assert.ok(idx.includes("PM2_NAME"), "restart por nome ausente");
+    const idxPrefixo = fs.readFileSync("src/routes/prefix.js", "utf8");
+    assert.ok(idxPrefixo.includes("PM2_NAME"), "restart por nome ausente");
     assert.ok(
       idx.includes("interaction.message?.author?.id"),
       "filtro de botões por autor ausente",
