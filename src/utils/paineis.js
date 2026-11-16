@@ -108,7 +108,15 @@ function criarPainelFila(state, pagina = 0) {
   // Autoplay tem requestedBy null — evita renderizar <@null> / <@undefined>.
   const rotuloPedido = (faixa) =>
     faixa && faixa.requestedBy ? `<@${faixa.requestedBy}>` : "📻 Autoplay";
-  let descricao = `**Tocando Agora:**\n🔹 [${current.title}](${current.url}) | ${rotuloPedido(current)}\n\n`;
+  // Placeholder otimista ainda sem metadados (null logo após !play playlist):
+  // nunca pode crashar o !queue (era TypeError reading 'title').
+  const rotuloFaixa = (faixa) => {
+    const t = (faixa && (faixa.title || faixa.query)) || "🔍 Buscando...";
+    if (faixa && faixa.url) return `[${t}](${faixa.url})`;
+    return t.length > 80 ? `${t.slice(0, 77)}...` : t;
+  };
+  const atual = current || {};
+  let descricao = `**Tocando Agora:**\n🔹 ${rotuloFaixa(atual)} | ${rotuloPedido(atual)}\n\n`;
 
   if (queue.length > 1) {
     descricao += `**Próximas Músicas:**\n`;
@@ -116,7 +124,7 @@ function criarPainelFila(state, pagina = 0) {
     const fim = Math.min(inicio + itensPorPagina, queue.length);
 
     for (let i = inicio; i < fim; i++) {
-      descricao += `\`${i}.\` [${queue[i].title}](${queue[i].url}) | ${rotuloPedido(queue[i])}\n`;
+      descricao += `\`${i}.\` ${rotuloFaixa(queue[i])} | ${rotuloPedido(queue[i])}\n`;
     }
 
     embed.setFooter({

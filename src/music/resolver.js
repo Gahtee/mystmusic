@@ -19,6 +19,25 @@ function cookieArgs() {
   return [];
 }
 
+// Cookies: o YouTube com conta logada exige PO Token via bgutil, que falha
+// no Pi ("Signature solving failed" → só storyboards →
+// "Requested format is not available"). O stderr do bot usa --no-warnings,
+// então os WARNINGs que identificariam o PO Token NUNCA aparecem — o detector
+// antigo nunca casava e o fallback nunca disparava (bug 16/11).
+// Inversão 16/11: default é SEM cookies (clients anônimos voltam com opus
+// 249/250/251 + m3u8 normalmente). Retry COM cookies só quando o erro pede
+// login de verdade (Sign in to confirm / age-restricted); esses vídeos
+// realmente precisam de conta e o retry tem chance de salvar.
+let _cookiesPoisoned = false; // legado/compat: true = pula cookies sempre
+
+function shouldSkipCookies() {
+  return true; // default sem cookies; retry pontual usa cookieArgs() direto
+}
+
+function needsLoginRetry(stderr) {
+  return /Sign in to confirm|age[- ]restricted|log in/i.test(String(stderr || ""));
+}
+
 const YTDLP_TIMEOUT_MS = 60_000;
 const YTDLP_MAX_BUFFER = 1024 * 1024 * 20;
 
@@ -219,7 +238,6 @@ async function getAudioMetadata(query, searchEngine = "ytsearch") {
   const target = isUrl ? query : `${searchEngine}1:${query}`;
 
   const args = [
-    ...cookieArgs(),
     ...potArgs(),
     "--js-runtimes",
     "node",
@@ -231,7 +249,23 @@ async function getAudioMetadata(query, searchEngine = "ytsearch") {
     target,
   ];
 
-  const { stdout } = await ytDlpJson(args, query);
+  let stdout;
+  try {
+    ({ stdout } = await ytDlpJson(args, query));
+  } catch (err) {
+    // Default é sem cookies (PO Token quebra com conta logada no Pi).
+    // Retry COM cookies só se o erro pedir login de verdade
+    // (age-restricted / "Sign in to confirm") — aí a conta pode salvar.
+    if (needsLoginRetry(stderrOf(err))) {
+      try {
+        ({ stdout } = await ytDlpJson([...cookieArgs(), ...args], query));
+      } catch (err2) {
+        throw friendlyExtractionError(err2, query);
+      }
+    } else {
+      throw friendlyExtractionError(err, query);
+    }
+  }
 
   let data;
   try {
@@ -370,9 +404,12 @@ function attachProcesses(stream, processes) {
 // -ss POS-input descarta o prefixo ja em PCM local (barato, sem rede).
 // Seguro aqui porque o SFX NAO passa por este ffmpeg: entra no PcmMixer via
 // memoria (playOverlay), imune ao bug antigo do -ss pos-input no amix.
-function getPcmStreamWithSeek(url, seekSec = 0) {
+function getPcmStreamWithSeek(url, seekSec = 0, opts = {}) {
+  // Default sem cookies (PO Token com conta logada falha no Pi e o tubo
+  // nasce vazio → bot mudo). Retry com cookies fica no caller via opts.
+  const skipCookies = opts.skipCookies !== false;
   const baseArgs = [
-    ...cookieArgs(),
+    ...(skipCookies ? [] : cookieArgs()),
     ...potArgs(),
     "-f",
     "bestaudio[acodec=opus]/bestaudio/best",
@@ -439,9 +476,10 @@ function getPcmStreamWithSeek(url, seekSec = 0) {
   return attachProcesses(ffProcess.stdout, [ytProcess, ffProcess]);
 }
 
-function getPcmStream(url) {
+function getPcmStream(url, opts = {}) {
+  const skipCookies = opts.skipCookies !== false;
   const baseArgs = [
-    ...cookieArgs(),
+    ...(skipCookies ? [] : cookieArgs()),
     ...potArgs(),
     "-f",
     "bestaudio[acodec=opus]/bestaudio/best",
@@ -532,5 +570,13 @@ module.exports = {
   getListParam,
   PLAYLIST_FETCH_MAX,
   RADIO_FETCH_MAX,
+  needsLoginRetry,
   _cache: { get: cacheGet, set: cacheSet, clear: () => metadataCache.clear() },
+  _cookies: {
+    // Compat legada: extrações são sem cookies por padrão.
+    poisoned: () => true,
+    markPoisoned: () => {},
+    shouldSkip: shouldSkipCookies,
+    reset: () => {},
+  },
 };

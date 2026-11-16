@@ -383,20 +383,74 @@ async function main() {
       }) +
       "</script>";
     const fakeFetch = async () => ({ ok: true, status: 200, text: async () => html });
+    // env sem credencial → cai direto no embed
     const res = await spotify.resolveSpotifyLink(
       "https://open.spotify.com/track/0VjIjW4GlUZAMYd2vXMi3b",
       fakeFetch,
+      {},
     );
     assert.strictEqual(res.query, "Blinding Lights - The Weeknd");
+    assert.strictEqual(res.source, "embed");
 
     const fake404 = async () => ({ ok: false, status: 404, text: async () => "" });
     await assert.rejects(
       spotify.resolveSpotifyLink(
         "https://open.spotify.com/track/0VjIjW4GlUZAMYd2vXMi3b",
         fake404,
+        {},
       ),
       /não encontrado/i,
     );
+  });
+
+  await check("spotify: Web API pagina playlist (mock, 250 faixas)", async () => {
+    const spotify = require("../src/music/spotify.js");
+    spotify.clearSpotifyTokenCache();
+    const fakeFetch = async (url) => {
+      if (url.includes("accounts.spotify.com")) {
+        return { ok: true, status: 200, json: async () => ({ access_token: "FAKE", expires_in: 3600 }) };
+      }
+      if (url.includes("/playlists/") && url.includes("fields=name")) {
+        return { ok: true, status: 200, json: async () => ({ name: "Grande", tracks: { total: 250 } }) };
+      }
+      if (url.includes("/tracks?")) {
+        const off = Number((url.match(/offset=(\d+)/) || [])[1] || 0);
+        const n = off === 200 ? 50 : 100;
+        const items = Array.from({ length: n }, (_, i) => ({
+          track: { name: `T${off + i}`, artists: [{ name: "A" }], is_local: false },
+        }));
+        return { ok: true, status: 200, json: async () => ({ total: 250, items, next: off + n < 250 ? "x" : null }) };
+      }
+      throw new Error(`URL inesperada: ${url}`);
+    };
+    const env = { SPOTIFY_CLIENT_ID: "x", SPOTIFY_CLIENT_SECRET: "y" };
+    const r = await spotify.resolveViaApi(
+      { type: "playlist", id: "ABCDEF1234567890123456" },
+      fakeFetch,
+      env,
+    );
+    assert.strictEqual(r.tracks.length, 250, "paginação não trouxe tudo");
+    assert.strictEqual(r.source, "api");
+    // via resolveSpotifyLink também prefere a API
+    spotify.clearSpotifyTokenCache();
+    const r2 = await spotify.resolveSpotifyLink(
+      "https://open.spotify.com/playlist/ABCDEF1234567890123456",
+      fakeFetch,
+      env,
+    );
+    assert.strictEqual(r2.tracks.length, 250);
+  });
+
+  await check("spotify: credencial inválida falha claro; token expira renova", async () => {
+    const spotify = require("../src/music/spotify.js");
+    spotify.clearSpotifyTokenCache();
+    const bad = async () => ({ ok: false, status: 401, json: async () => ({}) });
+    await assert.rejects(
+      spotify.fetchSpotifyToken("x", "y-errada", bad),
+      /rejeitou/i,
+    );
+    assert.ok(spotify.hasSpotifyCreds({ SPOTIFY_CLIENT_ID: "a", SPOTIFY_CLIENT_SECRET: "b" }));
+    assert.ok(!spotify.hasSpotifyCreds({}));
   });
 
   await check("sfx: parseOwnerIds filtra IDs inválidos", () => {
@@ -828,6 +882,30 @@ async function main() {
       assert.strictEqual(typeof resolver.normalizeMetadata, "function");
     },
   );
+
+  await check("resolver: default sem cookies; login pede retry com cookies", () => {
+    const r = require("../src/music/resolver.js");
+    assert.strictEqual(r._cookies.shouldSkip(), true, "default deveria pular cookies (PO Token quebra no Pi)");
+    assert.strictEqual(typeof r.needsLoginRetry, "function");
+    assert.strictEqual(r.needsLoginRetry("Sign in to confirm"), true);
+    assert.strictEqual(r.needsLoginRetry("age-restricted content"), true);
+    assert.strictEqual(r.needsLoginRetry("Requested format is not available"), false);
+    assert.strictEqual(r.needsLoginRetry("Video unavailable"), false);
+  });
+
+  await check("painel fila tolera current/queue null (crash 16/11)", () => {
+    const { criarPainelFila } = require("../src/utils/paineis.js");
+    const p = criarPainelFila(
+      { current: null, queue: [{ title: null, url: null, query: "X - Y", requestedBy: "1" }] },
+      0,
+    );
+    assert.ok(p.embeds[0].data.description.includes("Buscando"));
+    const p2 = criarPainelFila(
+      { current: { title: "T", url: "https://x", requestedBy: null }, queue: [{ title: "T", url: "https://x" }] },
+      0,
+    );
+    assert.ok(p2.embeds[0].data.description.includes("Autoplay"));
+  });
 
   await check("cache de metadados: 2ª chamada não dispara yt-dlp", async () => {
     resolver._cache.clear();

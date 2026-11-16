@@ -34,7 +34,7 @@ npm install
 cp .env.example .env  # se não existir, crie conforme abaixo
 ```
 
-### `.env`
+### `.env` (existe `.env.example` como modelo)
 
 ```env
 TOKEN=seu_token_do_bot
@@ -43,7 +43,24 @@ GUILDS=ids_das_guilds_permitidas,separados_por_virgula
 OWNER_IDS=seu_user_id_do_discord
 # opcional:
 # cookies.txt na raiz (cookies do YouTube exportados) — melhora extração
+# SPOTIFY_CLIENT_ID=... SPOTIFY_CLIENT_SECRET=... (p/ playlists do Spotify >50 faixas)
 ```
+
+#### Spotify API (opcional — playlists grandes)
+
+Sem credencial, link do Spotify resolve via embed público (`open.spotify.com/embed`, sem login): **teto de ~50 faixas por playlist e ~10 top tracks por artista** — resto é cortado.
+
+Com `SPOTIFY_CLIENT_ID` + `SPOTIFY_CLIENT_SECRET` no `.env`, dá para buscar a playlist inteira, de 100 em 100 (sem teto):
+
+1. Crie um app grátis em https://developer.spotify.com/dashboard (qualquer nome/descrição).
+2. Copie **Client ID** e **Client Secret** (Settings → Basic Information) para o `.env`.
+3. `pm2 restart mystmusic`.
+
+Como funciona (fluxo **Client Credentials**, server-to-server, sem login de usuário):
+- `POST https://accounts.spotify.com/api/token` com `Authorization: Basic base64(ID:SECRET)` + `grant_type=client_credentials` → `access_token` Bearer (vale 3600 s).
+- `GET https://api.spotify.com/v1/playlists/{id}/tracks?limit=100&offset=N` (e `/v1/albums/{id}/tracks`, `/v1/artists/{id}/top-tracks`) com `Authorization: Bearer …`, paginando `offset` até `total`.
+- Privadas/restritas continuam inacessíveis (precisariam de login OAuth com escopo) — só públicas.
+- Código ainda não implementado: hoje `src/music/spotify.js` só usa o embed; com as vars no `.env`/`env.js` o próximo passo é trocar `resolveSpotifyLink` para tentar a API primeiro e cair no embed como fallback.
 
 > **Não use `USER=` para o seu ID.** No Linux `$USER` já existe (usuário do SO) e o `dotenv` não sobrescreve — o bot leria `gahtee`/`pi` em vez do ID. Use sempre `OWNER_IDS`. Para pegar seu ID: Discord → Ajustes → Avançado → modo desenvolvedor → botão direito no seu nome → Copiar ID.
 

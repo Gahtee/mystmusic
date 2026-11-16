@@ -36,4 +36,11 @@ module.exports = {
   // Segundo bot pode operar só no prefixo (evita resposta dupla nos /slash,
   // que são por bot e o Discord mostraria os dois).
   ENABLE_SLASH: normalizeBool(process.env.ENABLE_SLASH, true),
+  // ── Spotify Web API (Client Credentials) ──
+  // Sem isso o bot usa embed público (~50 faixas/playlist, ~10 top tracks/artista).
+  // Com ID + SECRET, resolveSpotifyLink pode paginar /v1/playlists/{id}/tracks
+  // (limit=100 + offset) e pegar playlists de qualquer tamanho.
+  // Criar app em https://developer.spotify.com/dashboard → Client ID + Client Secret.
+  SPOTIFY_CLIENT_ID: (process.env.SPOTIFY_CLIENT_ID || "").trim(),
+  SPOTIFY_CLIENT_SECRET: (process.env.SPOTIFY_CLIENT_SECRET || "").trim(),
 };
